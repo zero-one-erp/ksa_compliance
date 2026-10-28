@@ -35,3 +35,18 @@ class TestPhase1AndGenerations(IntegrationTestCase):
                                 custom_vat_registration_number=None, custom_additional_ids=[])
         siaf._set_buyer_details(customer, 'Simplified', frappe._dict(doctype='Payment Entry'))
         self.assertFalse(siaf.get('buyer_street_name'))
+
+    def test_a_new_generation_leaves_another_doctypes_rows_latest(self):
+        # A POS Invoice and a Sales Invoice can carry the same name; only the same document's rows give way.
+        def row(name, doctype, latest):
+            doc = frappe.new_doc(DOCTYPE)
+            doc.name, doc.sales_invoice, doc.invoice_doctype, doc.is_latest = name, '_SAME-NAME-0001', doctype, latest
+            doc.db_insert()
+
+        row('_siaf-pos', 'POS Invoice', 1)
+        row('_siaf-si-old', 'Sales Invoice', 1)
+        new = frappe.new_doc(DOCTYPE)
+        new.sales_invoice, new.invoice_doctype, new.precomputed = '_SAME-NAME-0001', 'Sales Invoice', 1
+        new.before_insert()
+        self.assertEqual(frappe.db.get_value(DOCTYPE, '_siaf-pos', 'is_latest'), 1)
+        self.assertEqual(frappe.db.get_value(DOCTYPE, '_siaf-si-old', 'is_latest'), 0)

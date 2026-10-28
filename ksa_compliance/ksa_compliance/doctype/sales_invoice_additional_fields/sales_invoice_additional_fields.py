@@ -167,8 +167,10 @@ class SalesInvoiceAdditionalFields(Document):
     def before_insert(self):
         self.integration_status = 'Ready For Batch'
         self.is_latest = True
-        # Mark any pre-existing sales invoice additional fields as no longer being latest
-        frappe.db.set_value('Sales Invoice Additional Fields', {'sales_invoice': self.sales_invoice}, 'is_latest', 0)
+        # Mark any pre-existing sales invoice additional fields as no longer being latest: those of the same document
+        # only, since a POS Invoice and a Sales Invoice can carry the same name.
+        frappe.db.set_value('Sales Invoice Additional Fields',
+                            {'sales_invoice': self.sales_invoice, 'invoice_doctype': self.invoice_doctype}, 'is_latest', 0)
 
         if self.precomputed:
             return
