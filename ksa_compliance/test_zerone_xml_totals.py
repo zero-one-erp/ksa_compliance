@@ -121,3 +121,16 @@ class TestRestaurantBillXml(IntegrationTestCase):
         self.assertEqual(total, [round(sum(subtotals), 2)], 'BR-CO-14')
         self.assertEqual(inclusive, round(exclusive + sum(subtotals), 2), 'BR-CO-15')
         self.assertEqual((inclusive, round(sum(subtotals), 2)), (invoice.grand_total, invoice.total_taxes_and_charges))
+
+    def test_a_line_discount_is_stated_net_of_vat_like_the_price(self):
+        # 32 at 10% off: the line's net price is 25.04, so its discount is 3.20 / 1.15 = 2.78 and its gross price the
+        # menu price net of VAT, 27.83 (27.82 from the two rounded parts). It said 3.20 off a gross price of 28.24.
+        _invoice, xml = self.xml_for([(32, 10)])
+        line = xml.split('<cac:InvoiceLine>')[1]
+        allowance = line.split('<cac:AllowanceCharge>')[1]
+        amount = float(re.search(r'<cbc:Amount[^>]*>([^<]+)<', allowance).group(1))
+        base = float(re.search(r'<cbc:BaseAmount[^>]*>([^<]+)<', allowance).group(1))
+        net_price = float(re.search(r'<cbc:PriceAmount[^>]*>([^<]+)<', line).group(1))
+        self.assertEqual(amount, 2.78)
+        self.assertAlmostEqual(base, 32 / 1.15, delta=0.011)
+        self.assertEqual(round(base - amount, 2), net_price)

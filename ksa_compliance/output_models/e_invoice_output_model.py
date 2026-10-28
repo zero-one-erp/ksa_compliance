@@ -721,6 +721,10 @@ class Einvoice:
             tax_percent = abs(item.tax_rate or 0.0)
             tax_amount_with_qty = abs(item.tax_amount or 0.0)
             discount_with_qty = abs(item.discount_amount * item.qty) if has_discount else 0.0
+            if is_tax_included:
+                # The discount is taken off the VAT-inclusive price, and the line's amounts are net of VAT: so is its
+                # discount, or the gross price (amount + discount) is neither the price nor its net (28.24 for 32).
+                discount_with_qty = flt(discount_with_qty / (1 + (tax_percent / 100)), 2)
             amount_with_qty = abs(
                 flt(abs(item.amount) / (1 + (tax_percent / 100)), 2) if is_tax_included else item.amount
             )
