@@ -388,7 +388,9 @@ class SalesInvoiceAdditionalFields(Document):
         _is_b2b_customer = invoice_type == 'Standard'
 
         if invoice.doctype == 'Payment Entry':
-            # Payment Entry: retain existing Customer-master address lookup
+            # Payment Entry: retain existing Customer-master address lookup. A customer with neither a primary nor a
+            # linked address leaves it unset, which a simplified (B2C) document allows.
+            address_name = None
             if customer.customer_primary_address:
                 address_name = customer.customer_primary_address
             else:

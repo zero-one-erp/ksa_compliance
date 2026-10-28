@@ -27,3 +27,11 @@ class TestPhase1AndGenerations(IntegrationTestCase):
         # A posting time is the site's local time; 12:00 in Riyadh is 09:00Z, whatever the server's clock zone.
         with mock.patch.object(jinja, 'get_system_timezone', return_value='Asia/Riyadh', create=True):
             self.assertEqual(jinja._format_date('2026-10-28', '12:00:00'), '2026-10-28T09:00:00Z')
+
+    def test_a_payment_entry_customer_without_any_address_on_a_simplified_invoice(self):
+        # No primary address and no linked one: a simplified (B2C) document needs none and must not fail.
+        siaf = frappe.new_doc(DOCTYPE)
+        customer = frappe._dict(name='_no such customer', customer_primary_address=None,
+                                custom_vat_registration_number=None, custom_additional_ids=[])
+        siaf._set_buyer_details(customer, 'Simplified', frappe._dict(doctype='Payment Entry'))
+        self.assertFalse(siaf.get('buyer_street_name'))
