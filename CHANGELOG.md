@@ -8,6 +8,14 @@ to a section with the version name.
 
 ## Unreleased Changes
 
+## ZerOne 0.61.13 — 2026-10-29
+
+* Correct Phase 1 timestamps in the site timezone and allow address-free simplified prepayments.
+* Keep additional-field generations isolated by invoice doctype and name.
+* Reconcile bounded VAT rounding residues and use net-of-VAT inclusive discount bases.
+
+This fork release includes the reviewed fixes from PR1; upstream tags are unchanged.
+
 ## 0.61.9
 
 Contributed by [Yamen Afifi](https://github.com/yamenafifi)
