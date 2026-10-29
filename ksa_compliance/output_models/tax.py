@@ -117,6 +117,24 @@ def create_tax_total(tax_categories: dict) -> dict:
     )
 
 
+def reconcile_tax_total(tax_total: frappe._dict, document_tax: float, lines: int) -> None:
+    """Make the VAT subtotals add up to the document's VAT, which the XML states as its TaxTotal and the books carry.
+
+    The subtotals sum the lines' VAT, each rounded; ERPNext puts the rounding difference into the tax row instead
+    (with VAT-inclusive prices, so that the lines add up to the prices charged). A bill of 32 + 12 + 8 then said 6.78
+    in TaxTotal and 6.77 in its subtotal, and BR-CO-14 (total = sum of subtotals) and BR-CO-15 (inclusive = exclusive +
+    sum of subtotals) rejected it. The difference goes to the largest taxed subtotal, which BR-S-09 allows (within 1
+    of taxable x rate). A difference beyond a halala a line is not rounding, and is left for validation to report.
+    """
+    residue = rounded(document_tax - sum(rounded(row.tax_amount, 2) for row in tax_total.tax_subtotal), 2)
+    taxed = [row for row in tax_total.tax_subtotal if row.tax_category and row.tax_category.percent]
+    if not residue or not taxed or abs(residue) > 0.01 * max(lines, 1):
+        return
+    largest = max(taxed, key=lambda row: abs(row.tax_amount))
+    largest.tax_amount = rounded(rounded(largest.tax_amount, 2) + residue, 2)
+    tax_total.tax_amount = rounded(sum(rounded(row.tax_amount, 2) for row in tax_total.tax_subtotal), 2)
+
+
 def _get_amounts(tax_category: TaxCategoryByItems) -> frappe._dict:
     taxable_amount = 0
     tax_amount = 0

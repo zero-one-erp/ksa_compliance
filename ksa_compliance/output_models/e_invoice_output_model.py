@@ -21,7 +21,7 @@ from frappe.utils import flt
 from .service import get_right_fieldname, update_result
 from .prepayment_invoice.prepayment_invoice_factory import prepayment_invoice_factory_create
 
-from .tax import create_tax_categories, create_allowance_charge, create_tax_total
+from .tax import create_tax_categories, create_allowance_charge, create_tax_total, reconcile_tax_total
 
 
 class Einvoice:
@@ -721,6 +721,10 @@ class Einvoice:
             tax_percent = abs(item.tax_rate or 0.0)
             tax_amount_with_qty = abs(item.tax_amount or 0.0)
             discount_with_qty = abs(item.discount_amount * item.qty) if has_discount else 0.0
+            if is_tax_included:
+                # The discount is taken off the VAT-inclusive price, and the line's amounts are net of VAT: so is its
+                # discount, or the gross price (amount + discount) is neither the price nor its net (28.24 for 32).
+                discount_with_qty = flt(discount_with_qty / (1 + (tax_percent / 100)), 2)
             amount_with_qty = abs(
                 flt(abs(item.amount) / (1 + (tax_percent / 100)), 2) if is_tax_included else item.amount
             )
@@ -901,6 +905,9 @@ class Einvoice:
         self.append_to_item_lines(item_lines, is_tax_included, self.sales_invoice_doc)
         tax_categories = create_tax_categories(self.sales_invoice_doc, item_lines, is_tax_included)
         tax_total = create_tax_total(tax_categories)
+        if self.sales_invoice_doc.doctype != 'Payment Entry':
+            # The subtotals add up to the VAT the XML states (BR-CO-14, BR-CO-15); a Payment Entry's is computed below.
+            reconcile_tax_total(tax_total, abs(self.result['invoice'].get('total_taxes_and_charges') or 0.0), len(item_lines))
         self.result['invoice']['tax_total'] = tax_total
         allowance_charge = create_allowance_charge(self.sales_invoice_doc, tax_total)
         self.result['invoice']['allowance_charge'] = allowance_charge

@@ -1,6 +1,7 @@
 import base64
 import datetime
 import json
+from zoneinfo import ZoneInfo
 from base64 import b64encode
 from io import BytesIO
 from typing import cast, TypedDict, Iterable, Callable, TypeVar, Optional
@@ -12,7 +13,7 @@ import frappe
 from erpnext.accounts.doctype.pos_invoice.pos_invoice import POSInvoice
 from erpnext.accounts.doctype.sales_invoice.sales_invoice import SalesInvoice
 from erpnext.setup.doctype.branch.branch import Branch
-from frappe.utils.data import get_time, getdate
+from frappe.utils.data import get_system_timezone, get_time, getdate
 from ksa_compliance.ksa_compliance.doctype.zatca_business_settings.zatca_business_settings import ZATCABusinessSettings
 from ksa_compliance.ksa_compliance.doctype.zatca_phase_1_business_settings.zatca_phase_1_business_settings import (
     ZATCAPhase1BusinessSettings,
@@ -113,10 +114,14 @@ def _encode_input(input: str, tag: list[int]) -> str:
 def _format_date(date: str, time: str) -> str:
     """
     Format date & time into UTC format something like : " 2021-12-13T10:39:15Z"
+
+    The posting date and time are the site's local time (System Settings' time zone). A naive datetime's
+    astimezone() reads it in the server process's zone instead, which put a Riyadh 12:00 sale at 12:00Z in a
+    UTC container, three hours late.
     """
     posting_date = getdate(date)
     time = get_time(time)
-    combined_datetime = datetime.datetime.combine(posting_date, time)
+    combined_datetime = datetime.datetime.combine(posting_date, time, tzinfo=ZoneInfo(get_system_timezone()))
     combined_utc = combined_datetime.astimezone(datetime.timezone.utc)
     time_stamp = combined_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
     return time_stamp
