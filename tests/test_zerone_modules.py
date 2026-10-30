@@ -15,6 +15,21 @@ class TestRegressionDiscovery(unittest.TestCase):
                 self.assertFalse(any(name and name.startswith(('frappe.tests', 'erpnext.tests')) for name in imports),
                                  'Use explicit SAR fixtures instead of automatic test-master loading')
 
+    def test_customer_and_group_names_are_distinct_per_run(self):
+        tree = ast.parse((PACKAGE / 'test_zerone_xml_totals.py').read_text())
+        records = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                fields = {key.value: value for key, value in zip(node.keys, node.values)
+                          if isinstance(key, ast.Constant)}
+                kind = fields.get('doctype')
+                if isinstance(kind, ast.Constant) and kind.value in ('Customer', 'Customer Group'):
+                    field = 'customer_name' if kind.value == 'Customer' else 'customer_group_name'
+                    records[kind.value] = ast.dump(fields[field])
+        self.assertNotEqual(records['Customer'], records['Customer Group'],
+                            'ERPNext rejects a customer with the same name as its customer group')
+        self.assertIn('uuid.uuid4()', (PACKAGE / 'test_zerone_xml_totals.py').read_text())
+
     def test_xml_checks_cannot_silently_skip_when_the_site_has_no_default_template(self):
         tree = ast.parse((PACKAGE / 'test_zerone_xml_totals.py').read_text())
         self.assertFalse(any(isinstance(node, ast.Attribute) and node.attr == 'skipTest' for node in ast.walk(tree)),

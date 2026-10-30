@@ -71,7 +71,7 @@ class TestRestaurantBillXml(ZeroneSiteTestCase):
             ignore_permissions=True)
         price_list = frappe.get_doc({'doctype': 'Price List', 'price_list_name': token,
                                      'enabled': 1, 'selling': 1, 'currency': 'SAR'}).insert(ignore_permissions=True)
-        customer_group = frappe.get_doc({'doctype': 'Customer Group', 'customer_group_name': token,
+        customer_group = frappe.get_doc({'doctype': 'Customer Group', 'customer_group_name': token + '-Group',
                                          'parent_customer_group': frappe.db.get_value(
                                              'Customer Group', {'is_group': 1}, 'name', order_by='lft asc')}).insert(
             ignore_permissions=True).name
@@ -79,7 +79,7 @@ class TestRestaurantBillXml(ZeroneSiteTestCase):
                                     'parent_territory': frappe.db.get_value(
                                         'Territory', {'is_group': 1}, 'name', order_by='lft asc')}).insert(
             ignore_permissions=True).name
-        customer = frappe.get_doc({'doctype': 'Customer', 'customer_name': token, 'customer_type': 'Individual',
+        customer = frappe.get_doc({'doctype': 'Customer', 'customer_name': token + '-Customer', 'customer_type': 'Individual',
                                    'customer_group': customer_group, 'territory': territory}).insert(
             ignore_permissions=True)
         address = frappe.get_doc({'doctype': 'Address', 'address_title': company, 'address_line1': 'Olaya St',
