@@ -5,14 +5,15 @@ bill of 32 + 12 + 8 carries 6.78 VAT while its lines carry 6.77. The XML stated 
 subtotal: BR-CO-14 (total = sum of subtotals) and BR-CO-15 (inclusive = exclusive + sum of subtotals) are errors, and
 ZATCA rejects such an invoice. Checked with the SDK's own rule sheets in the backend image (/opt/zatca).
 
-Outside the doctype folders on purpose (see test_zerone_phase1_and_generations.py).
+The Frappe runner supplies the connection; all test records are explicit and rolled back.
 """
 
 import re
 import uuid
+from unittest import TestCase, mock
 
 import frappe
-from frappe.tests import IntegrationTestCase
+from ksa_compliance.zerone_test_support import ZeroneSiteTestCase
 
 from ksa_compliance.output_models.tax import reconcile_tax_total
 
@@ -22,7 +23,7 @@ def subtotal(tax_amount, percent=15.0, taxable=0.0):
                         tax_category=frappe._dict(percent=percent))
 
 
-class TestReconcileTaxTotal(IntegrationTestCase):
+class TestReconcileTaxTotal(TestCase):
     def test_the_rounding_halala_goes_to_the_taxed_subtotal(self):
         total = frappe._dict(tax_amount=6.77, tax_subtotal=[subtotal(0.0, percent=0.0), subtotal(6.77)])
         reconcile_tax_total(total, 6.78, lines=3)
@@ -40,16 +41,8 @@ class TestReconcileTaxTotal(IntegrationTestCase):
         self.assertEqual(total.tax_subtotal[0].tax_amount, 3.0)
 
 
-class TestRestaurantBillXml(IntegrationTestCase):
+class TestRestaurantBillXml(ZeroneSiteTestCase):
     """The pilot restaurant's own bill, rendered as ksa_compliance renders it for ZATCA (unsigned, nothing sent)."""
-
-    def setUp(self):
-        super().setUp()
-        frappe.db.savepoint('zerone_xml_totals')
-
-    def tearDown(self):
-        frappe.db.rollback(save_point='zerone_xml_totals')
-        super().tearDown()
 
     def xml_for(self, prices):
         from ksa_compliance.generate_xml import generate_xml_file
@@ -58,20 +51,41 @@ class TestRestaurantBillXml(IntegrationTestCase):
         )
         from ksa_compliance.output_models.e_invoice_output_model import Einvoice
 
-        company = frappe.db.get_value('Company', {}, 'name', order_by='creation asc')
-        template = frappe.db.get_value('Sales Taxes and Charges Template',
-                                       {'company': company, 'is_default': 1, 'disabled': 0}, 'name')
-        if not template:
-            self.skipTest('no default VAT template on this site')
-        tax = frappe.get_doc('Sales Taxes and Charges Template', template)
-        for row in tax.taxes:
-            row.included_in_print_rate = 1
-        tax.save(ignore_permissions=True)
+        # Use a provisioned Saudi company, but none of its customer, tax or price-list defaults.
+        company = frappe.db.get_value('Company', {'country': 'Saudi Arabia', 'default_currency': 'SAR'},
+                                       'name', order_by='creation asc')
+        self.assertTrue(company, 'Run on a test site with a provisioned Saudi SAR company')
+        token = '_ZERONE-' + uuid.uuid4().hex[:12]
+        category = frappe.get_doc({'doctype': 'Tax Category', 'title': token,
+                                   'custom_zatca_category': 'Standard rate'}).insert(ignore_permissions=True)
+        parent = frappe.db.get_value('Account', {'company': company, 'root_type': 'Liability', 'is_group': 1},
+                                      'name', order_by='lft desc')
+        self.assertTrue(parent, 'The Saudi company needs its chart of accounts')
+        account = frappe.get_doc({'doctype': 'Account', 'account_name': token, 'company': company,
+                                  'parent_account': parent, 'account_type': 'Tax',
+                                  'account_currency': 'SAR'}).insert(ignore_permissions=True)
+        tax = frappe.get_doc({'doctype': 'Sales Taxes and Charges Template', 'title': token,
+                              'company': company, 'is_default': 0, 'tax_category': category.name,
+                              'taxes': [{'charge_type': 'On Net Total', 'account_head': account.name,
+                                         'description': 'VAT 15%', 'rate': 15, 'included_in_print_rate': 1}]}).insert(
+            ignore_permissions=True)
+        price_list = frappe.get_doc({'doctype': 'Price List', 'price_list_name': token,
+                                     'enabled': 1, 'selling': 1, 'currency': 'SAR'}).insert(ignore_permissions=True)
+        customer_group = frappe.get_doc({'doctype': 'Customer Group', 'customer_group_name': token,
+                                         'parent_customer_group': frappe.db.get_value(
+                                             'Customer Group', {'is_group': 1}, 'name', order_by='lft asc')}).insert(
+            ignore_permissions=True).name
+        territory = frappe.get_doc({'doctype': 'Territory', 'territory_name': token,
+                                    'parent_territory': frappe.db.get_value(
+                                        'Territory', {'is_group': 1}, 'name', order_by='lft asc')}).insert(
+            ignore_permissions=True).name
+        customer = frappe.get_doc({'doctype': 'Customer', 'customer_name': token, 'customer_type': 'Individual',
+                                   'customer_group': customer_group, 'territory': territory}).insert(
+            ignore_permissions=True)
         address = frappe.get_doc({'doctype': 'Address', 'address_title': company, 'address_line1': 'Olaya St',
                                   'city': 'Riyadh', 'country': 'Saudi Arabia', 'pincode': '12345',
                                   'links': [{'link_doctype': 'Company', 'link_name': company}]}).insert(
             ignore_permissions=True).name
-        frappe.db.set_value('ZATCA Business Settings', {'company': company}, 'status', 'Revoked')
         settings = frappe.new_doc('ZATCA Business Settings')
         settings.update({'company': company, 'company_address': address, 'currency': 'SAR', 'seller_name': company,
                          'vat_registration_number': '300000000000003', 'street': 'Olaya St', 'building_number': '1234',
@@ -79,19 +93,30 @@ class TestRestaurantBillXml(IntegrationTestCase):
                          'country_code': 'SA', 'company_unit': 'Main', 'company_unit_serial': '1-ZerOne|2-Test|3-1',
                          'company_category': 'Restaurant', 'status': 'Active', 'fatoora_server': 'Sandbox',
                          'tax_rate': 15, 'zatca_tax_category': 'Standard rate', 'cli_setup': 'Manual'})
-        settings.name = '_ZERONE-XML-TOTALS'
-        settings.db_insert()
-        group = frappe.db.get_value('Item Group', {'is_group': 0}, 'name')
+        # The unsigned renderer gets this in-memory test settings document. Existing settings stay untouched.
+        from ksa_compliance.ksa_compliance.doctype.zatca_business_settings.zatca_business_settings import (
+            ZATCABusinessSettings,
+        )
+        settings.name = token
+        settings.enable_zatca_integration = 0
+        group = frappe.get_doc({'doctype': 'Item Group', 'item_group_name': token,
+                                'parent_item_group': frappe.db.get_value(
+                                    'Item Group', {'is_group': 1}, 'name', order_by='lft asc')}).insert(
+            ignore_permissions=True).name
+        uom = frappe.get_doc({'doctype': 'UOM', 'uom_name': token}).insert(ignore_permissions=True).name
         rows = []
         for price in prices:
             price, off = price if isinstance(price, tuple) else (price, 0)
             code = frappe.get_doc({'doctype': 'Item', 'item_code': f'_XML-{uuid.uuid4().hex[:6]}', 'item_name': 'Dish',
-                                   'item_group': group, 'stock_uom': 'Nos', 'is_stock_item': 0}).insert(
+                                   'item_group': group, 'stock_uom': uom, 'is_stock_item': 0}).insert(
                 ignore_permissions=True).name
             rows.append({'item_code': code, 'qty': 1, 'price_list_rate': price, 'discount_percentage': off,
                          'rate': price * (1 - off / 100)})
-        invoice = frappe.get_doc({'doctype': 'Sales Invoice', 'company': company, 'taxes_and_charges': template,
-                                  'customer': frappe.db.get_value('Customer', {'disabled': 0}, 'name'), 'items': rows})
+        invoice = frappe.get_doc({'doctype': 'Sales Invoice', 'company': company, 'taxes_and_charges': tax.name,
+                                  'tax_category': category.name,
+                                  'customer': customer.name, 'items': rows, 'currency': 'SAR', 'conversion_rate': 1,
+                                  'selling_price_list': price_list.name, 'price_list_currency': 'SAR',
+                                  'plc_conversion_rate': 1, 'ignore_pricing_rule': 1, 'disable_rounded_total': 1})
         invoice.set_missing_values()
         invoice.set_taxes()
         invoice.insert(ignore_permissions=True)
@@ -104,7 +129,9 @@ class TestRestaurantBillXml(IntegrationTestCase):
         siaf.invoice_type_transaction = siaf_module._get_invoice_type_transaction('Simplified', False)
         siaf.invoice_type_code = siaf._get_invoice_type_code(invoice)
         siaf.payment_means_type_code = siaf._get_payment_means_type_code(invoice)
-        return invoice, generate_xml_file(Einvoice(sales_invoice_additional_fields_doc=siaf, invoice_type='Simplified').result)
+        with mock.patch.object(ZATCABusinessSettings, 'for_invoice', return_value=settings):
+            xml = generate_xml_file(Einvoice(sales_invoice_additional_fields_doc=siaf, invoice_type='Simplified').result)
+        return invoice, xml
 
     def test_the_bill_adds_up_as_zatca_checks_it(self):
         invoice, xml = self.xml_for([32, 12, 8])
