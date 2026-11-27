@@ -1,0 +1,131 @@
+"""When an invoice's additional fields go to ZATCA: the rules alone, without Frappe, so they can be tested off a site.
+
+A standard (B2B) invoice is cleared at once, whatever the sending mode, because the buyer cannot use it before ZATCA
+clears it. A simplified (B2C) invoice is reported according to the mode the business settings name:
+
+- 'Live': on submission;
+- 'Batches': the legacy value, by the hourly job (the behaviour of sites that predate the other modes);
+- 'At a set time': once a day at the time the settings name, in the site's time zone;
+- 'Every 24 hours': 24 hours after the previous scheduled run.
+
+ZATCA expects a simplified invoice to be reported within 24 hours of its issue, so pending ones nearing that limit
+raise an alert.
+"""
+
+from __future__ import annotations
+
+import datetime
+from typing import Literal, Optional
+
+MODE_LIVE = 'Live'
+MODE_BATCHES = 'Batches'
+MODE_AT_SET_TIME = 'At a set time'
+MODE_EVERY_24_HOURS = 'Every 24 hours'
+SENDING_MODES = (MODE_LIVE, MODE_BATCHES, MODE_AT_SET_TIME, MODE_EVERY_24_HOURS)
+SCHEDULED_MODES = (MODE_AT_SET_TIME, MODE_EVERY_24_HOURS)
+
+# Draft additional fields in these statuses are waiting to be sent
+PENDING_STATUSES = ('Ready For Batch', 'Resend', 'Corrected')
+SENT_STATUSES = ('Accepted', 'Accepted with warnings')
+# Anything else a submitted additional fields document can carry is final: sending it again is refused
+FAILED_STATUSES = ('Rejected', 'Duplicate', 'Clearance switched off')
+
+StatusGroup = Literal['sent', 'not_sent', 'failed']
+STATUS_GROUPS = ('sent', 'not_sent', 'failed')
+
+REPORTING_LIMIT_HOURS = 24
+ALERT_AFTER_HOURS = 20
+# Pending invoices issued longer ago than this are not alerted on. It keeps a first run on an old site from flooding
+# users, and keeps it inside the retention of the notification log that makes the alert once per invoice.
+ALERT_LOOKBACK_DAYS = 7
+
+
+def normalize_mode(value: Optional[str]) -> str:
+    """The sending mode a stored value means. Blank or unknown values mean the legacy hourly batches."""
+    for mode in SENDING_MODES:
+        if (value or '').strip().lower() == mode.lower():
+            return mode
+    return MODE_BATCHES
+
+
+def is_standard_transaction(invoice_type_transaction: Optional[str]) -> bool:
+    """Whether an additional fields' invoice type transaction ('0100000' / '0200000', BR-KSA-06) is a standard one."""
+    return (invoice_type_transaction or '').startswith('01')
+
+
+def send_on_submit(mode: Optional[str], is_standard: bool) -> bool:
+    """Whether a newly created additional fields document is sent at once."""
+    return is_standard or normalize_mode(mode) == MODE_LIVE
+
+
+def hourly_job_sends(
+    mode: Optional[str], is_standard: bool, integration_status: Optional[str], near_reporting_limit: bool = False
+) -> bool:
+    """Whether the hourly job sends a pending additional fields document.
+
+    Under a scheduled mode a simplified invoice that was never attempted waits for its scheduled run, unless it is
+    already near the 24 hour reporting limit (a run every 24 hours alone could miss it). One already attempted
+    (Resend, Corrected) is retried hourly, so a transient failure does not cost it another day."""
+    if is_standard or near_reporting_limit:
+        return True
+    if normalize_mode(mode) not in SCHEDULED_MODES:
+        return True
+    return integration_status != 'Ready For Batch'
+
+
+def is_scheduled_run_due(
+    mode: Optional[str],
+    now: datetime.datetime,
+    sync_time: Optional[datetime.time],
+    last_run: Optional[datetime.datetime],
+) -> bool:
+    """Whether a scheduled run of the given mode is due at `now`, the previous one having started at `last_run`.
+
+    All times are the site's naive local times."""
+    mode = normalize_mode(mode)
+    if mode == MODE_AT_SET_TIME:
+        if sync_time is None:
+            return False
+        target = datetime.datetime.combine(now.date(), sync_time)
+        return now >= target and (last_run is None or last_run < target)
+
+    if mode == MODE_EVERY_24_HOURS:
+        return last_run is None or now - last_run >= datetime.timedelta(hours=24)
+
+    return False
+
+
+def status_group(integration_status: Optional[str], has_additional_fields: bool = True) -> StatusGroup:
+    """The report's group for an invoice whose latest additional fields carry `integration_status`."""
+    if not has_additional_fields or not integration_status or integration_status in PENDING_STATUSES:
+        return 'not_sent'
+    if integration_status in SENT_STATUSES:
+        return 'sent'
+    return 'failed'
+
+
+def statuses_for_group(group: StatusGroup) -> tuple[str, ...]:
+    if group == 'sent':
+        return SENT_STATUSES
+    if group == 'not_sent':
+        return PENDING_STATUSES
+    if group == 'failed':
+        return FAILED_STATUSES
+    raise ValueError(f'Unknown status group: {group}')
+
+
+def alert_cutoff(now: datetime.datetime, alert_after_hours: float = ALERT_AFTER_HOURS) -> datetime.datetime:
+    """Pending simplified invoices issued at or before this time are close to (or past) the reporting limit."""
+    return now - datetime.timedelta(hours=alert_after_hours)
+
+
+def is_near_reporting_limit(
+    issued_at: Optional[datetime.datetime], now: datetime.datetime, alert_after_hours: float = ALERT_AFTER_HOURS
+) -> bool:
+    return issued_at is not None and issued_at <= alert_cutoff(now, alert_after_hours)
+
+
+def hours_left(issued_at: datetime.datetime, now: datetime.datetime) -> float:
+    """Hours left before the 24 hour reporting limit; negative once it has passed."""
+    deadline = issued_at + datetime.timedelta(hours=REPORTING_LIMIT_HOURS)
+    return round((deadline - now).total_seconds() / 3600, 1)

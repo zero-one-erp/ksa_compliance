@@ -79,7 +79,9 @@ class ZATCABusinessSettings(Document):
         seller_name: DF.Data
         status: DF.Literal['Active', 'Revoked']
         street: DF.Data | None
-        sync_with_zatca: DF.Literal['Live', 'Batches']
+        last_scheduled_sync: DF.Datetime | None
+        sync_time: DF.Time | None
+        sync_with_zatca: DF.Literal['Live', 'Batches', 'At a set time', 'Every 24 hours']
         tax_rate: DF.Percent
         type_of_business_transactions: DF.Literal[
             'Let the system decide (both)', 'Simplified Tax Invoices', 'Standard Tax Invoices'
@@ -133,6 +135,13 @@ class ZATCABusinessSettings(Document):
     @property
     def is_live_sync(self) -> bool:
         return self.sync_with_zatca.lower() == 'live'
+
+    @property
+    def sending_mode(self) -> str:
+        """The sending mode of simplified invoices; standard ones are always sent at once."""
+        from ksa_compliance.zatca_sending_rules import normalize_mode
+
+        return normalize_mode(self.sync_with_zatca)
 
     @property
     def invoice_mode(self) -> InvoiceMode:
