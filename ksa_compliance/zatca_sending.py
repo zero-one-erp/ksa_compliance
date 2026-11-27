@@ -20,8 +20,11 @@ from ksa_compliance import logger
 from ksa_compliance import zatca_sending_rules as rules
 
 SIAF = 'Sales Invoice Additional Fields'
-INVOICE_DOCTYPES = ('Sales Invoice', 'POS Invoice')
+# Payment Entry: prepayment invoices (custom_prepayment_invoice) only
+INVOICE_DOCTYPES = ('Sales Invoice', 'POS Invoice', 'Payment Entry')
 BULK_LIMIT = 100
+BULK_STATUS_SECONDS = 24 * 3600
+BULK_JOB_TIMEOUT = 3480
 MAX_PAGE_LENGTH = 500
 SEND_LOCK_SECONDS = 300  # well above the API timeout (30 s) and the signing-free submit path
 ALERT_ROLES = ('Accounts Manager', 'System Manager')
@@ -57,8 +60,10 @@ def _send_lock(siaf_name: str) -> Iterator[bool]:
 def send_pending(siaf_name: str) -> dict:
     """Sends one pending additional fields document to ZATCA through the existing submit path, under the send lock.
 
-    Returns {'siaf', 'sent', 'integration_status', 'message', 'skipped'}: `skipped` is None when it was sent, else
-    'in_progress' (another worker holds the lock) or 'not_pending' (it is already final or gone).
+    Returns {'siaf', 'sent', 'outcome', 'integration_status', 'message', 'skipped'}. `skipped` is None when a send was
+    made, else 'in_progress' (another worker holds the lock) or 'not_pending' (it is already final or gone).
+    `outcome` ('sent' | 'failed' | 'retrying', see rules.send_outcome) and `sent` follow the status the send stored,
+    never the call's Ok: submit_to_zatca answers Ok for Rejected, Duplicate and Resend too.
     The outcome is committed before the lock is released, so the next holder sees it."""
     from ksa_compliance.ksa_compliance.doctype.sales_invoice_additional_fields.sales_invoice_additional_fields import (
         SalesInvoiceAdditionalFields,
@@ -67,23 +72,24 @@ def send_pending(siaf_name: str) -> dict:
     with _send_lock(siaf_name) as acquired:
         if not acquired:
             status = frappe.db.get_value(SIAF, siaf_name, 'integration_status')
-            return _send_result(
-                siaf_name, False, status, _('A send of this invoice is already in progress'), 'in_progress'
-            )
+            return _send_result(siaf_name, status, _('A send of this invoice is already in progress'), 'in_progress')
 
         # A locking read sees the latest committed row whatever this transaction read before.
         row = frappe.db.get_value(SIAF, siaf_name, ['docstatus', 'integration_status'], as_dict=True, for_update=True)
         if not row or row.docstatus != 0 or row.integration_status not in rules.PENDING_STATUSES:
+            # Nothing written yet: end the transaction so the row lock does not outlive the send lock
+            frappe.db.rollback()
             return _send_result(
                 siaf_name,
-                False,
                 row.integration_status if row else None,
                 _('This invoice is not waiting to be sent'),
                 'not_pending',
             )
 
         try:
-            doc = cast(SalesInvoiceAdditionalFields, frappe.get_doc(SIAF, siaf_name))
+            # Locking read again: a plain read in this transaction could return the row as it was before another
+            # worker's send, and saving that stale copy would fail after ZATCA had answered, losing its answer.
+            doc = cast(SalesInvoiceAdditionalFields, frappe.get_doc(SIAF, siaf_name, for_update=True))
             logger.info(f'Submitting {siaf_name}')
             result = doc.submit_to_zatca()
             message = result.ok_value if is_ok(result) else result.err_value
@@ -91,15 +97,20 @@ def send_pending(siaf_name: str) -> dict:
             frappe.db.commit()
         except Exception:
             frappe.db.rollback()
-            raise
+            logger.error(f'Error sending {siaf_name} to ZATCA', exc_info=True)
+            status = frappe.db.get_value(SIAF, siaf_name, 'integration_status')
+            return _send_result(siaf_name, status, _('Sending failed; it will be tried again'), None)
 
-        return _send_result(siaf_name, is_ok(result), doc.integration_status, message, None)
+        status = frappe.db.get_value(SIAF, siaf_name, 'integration_status')
+        return _send_result(siaf_name, status, message, None)
 
 
-def _send_result(siaf_name, sent, status, message, skipped) -> dict:
+def _send_result(siaf_name, status, message, skipped) -> dict:
+    outcome = rules.send_outcome(status)
     return {
         'siaf': siaf_name,
-        'sent': bool(sent),
+        'sent': skipped is None and outcome == 'sent',
+        'outcome': outcome if skipped is None else None,
         'integration_status': status or '',
         'message': message,
         'skipped': skipped,
@@ -120,16 +131,26 @@ def send_now(invoice: str, invoice_doctype: str = 'Sales Invoice') -> dict:
     """Sends one invoice's pending ZATCA additional fields now.
 
     Throws if the caller may not read and submit the invoice, if it has nothing pending (its status is final), or if a
-    send is already running. Returns the invoice's row: {'invoice', 'invoice_doctype', 'siaf', 'sent',
-    'integration_status', 'status_group', 'message'}."""
+    send is already running. Returns the invoice's row: {'invoice', 'invoice_doctype', 'siaf', 'sent', 'outcome',
+    'integration_status', 'status_group', 'message'}: `sent` is true only when ZATCA accepted it; `outcome` is 'sent',
+    'failed' (refused for good: Rejected, Duplicate, ...) or 'retrying' (still pending; a later run tries again)."""
     return _send_now(invoice, invoice_doctype)
 
 
 @frappe.whitelist(methods=['POST'])
 def send_now_bulk(invoices: str | list, invoice_doctype: str = 'Sales Invoice') -> dict:
-    """«إرسال المحدد»: sends up to BULK_LIMIT invoices, one at a time; one invoice's failure does not stop the rest.
+    """«إرسال المحدد»: queues up to BULK_LIMIT invoices for sending and returns at once.
 
-    Returns {'results': [row | {'invoice', 'error'}], 'sent': int, 'failed': int}."""
+    One background job per company sends that company's invoices one at a time, as the caller (each send checks the
+    caller's read and submit permission again); one invoice's failure does not stop the rest. A company that already
+    has a bulk send running is refused rather than queued twice.
+
+    Returns {'bulk_id', 'jobs': [{'company', 'job_id', 'invoices'}], 'refused': [{'invoice', 'invoice_doctype',
+    'error'}]}; poll get_bulk_send_status(bulk_id) for the results."""
+    from frappe.utils.background_jobs import enqueue
+
+    if invoice_doctype not in INVOICE_DOCTYPES:
+        frappe.throw(_('Unsupported invoice type: {0}').format(invoice_doctype))
     names = frappe.parse_json(invoices) if isinstance(invoices, str) else invoices
     if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
         frappe.throw(_('Invoices must be a list of names'))
@@ -137,25 +158,127 @@ def send_now_bulk(invoices: str | list, invoice_doctype: str = 'Sales Invoice') 
     if len(names) > BULK_LIMIT:
         frappe.throw(_('At most {0} invoices can be sent at once').format(BULK_LIMIT))
 
-    results, sent, failed = [], 0, 0
+    refused, by_company = [], {}
     for name in names:
+        company = frappe.db.get_value(invoice_doctype, name, 'company')
+        if not company or not frappe.has_permission(invoice_doctype, 'read', doc=name):
+            # Unknown and unreadable invoices get the same answer, so the list does not tell which exist
+            refused.append(_bulk_error(name, invoice_doctype, _('{0} {1} not found').format(_(invoice_doctype), name)))
+            continue
+        by_company.setdefault(company, []).append(name)
+
+    bulk_id = uuid.uuid4().hex
+    jobs = []
+    for company, company_names in by_company.items():
+        job_id = _bulk_job_id(company)
+        _bulk_put(bulk_id, company, {'status': 'queued', 'invoices': company_names, 'results': []})
+        job = enqueue(
+            'ksa_compliance.zatca_sending.send_now_bulk_job',
+            queue='long',
+            timeout=BULK_JOB_TIMEOUT,
+            job_id=job_id,
+            deduplicate=True,
+            bulk_id=bulk_id,
+            company=company,
+            invoices=company_names,
+            invoice_doctype=invoice_doctype,
+        )
+        if job is None:
+            # A bulk send of this company is still queued or running
+            frappe.cache.delete_value(_bulk_key(bulk_id, company))
+            message = _('A bulk send for {0} is already running; try again when it ends').format(company)
+            refused += [_bulk_error(n, invoice_doctype, message) for n in company_names]
+            continue
+        jobs.append({'company': company, 'job_id': job_id, 'invoices': company_names})
+
+    frappe.cache.set_value(
+        _bulk_key(bulk_id),
+        {
+            'user': frappe.session.user,
+            'invoice_doctype': invoice_doctype,
+            'companies': [j['company'] for j in jobs],
+            'refused': refused,
+        },
+        expires_in_sec=BULK_STATUS_SECONDS,
+    )
+    return {'bulk_id': bulk_id, 'jobs': jobs, 'refused': refused}
+
+
+def send_now_bulk_job(bulk_id: str, company: str, invoices: list[str], invoice_doctype: str) -> None:
+    """Background job of send_now_bulk: one company's invoices, one at a time, progress kept for the status poll."""
+    state = {'status': 'running', 'invoices': invoices, 'results': []}
+    _bulk_put(bulk_id, company, state)
+    for name in invoices:
         try:
-            row = _send_now(name, invoice_doctype)
-            results.append(row)
-            sent += 1 if row['sent'] else 0
-            failed += 0 if row['sent'] else 1
+            state['results'].append(_send_now(name, invoice_doctype))
+        except ZatcaSendInProgress as e:
+            # Another sender has it in hand: in flight, not failed
+            state['results'].append(
+                {'invoice': name, 'invoice_doctype': invoice_doctype, 'outcome': 'retrying', 'message': str(e)}
+            )
         except (frappe.PermissionError, frappe.ValidationError) as e:
-            results.append({'invoice': name, 'invoice_doctype': invoice_doctype, 'error': str(e) or type(e).__name__})
-            failed += 1
-        except Exception as e:
+            state['results'].append(_bulk_error(name, invoice_doctype, str(e) or type(e).__name__))
+        except Exception:
             logger.error(f'Error sending {name} to ZATCA', exc_info=True)
-            results.append({'invoice': name, 'invoice_doctype': invoice_doctype, 'error': str(e) or type(e).__name__})
-            failed += 1
+            state['results'].append(_bulk_error(name, invoice_doctype, _('Sending failed; it will be tried again')))
         finally:
             # Each refusal queues a message for the desk; the result carries them instead.
             frappe.clear_messages()
+        _bulk_put(bulk_id, company, state)
+    state['status'] = 'done'
+    _bulk_put(bulk_id, company, state)
 
-    return {'results': results, 'sent': sent, 'failed': failed}
+
+@frappe.whitelist()
+def get_bulk_send_status(bulk_id: str) -> dict:
+    """The progress of a send_now_bulk call, for its caller only.
+
+    Returns {'bulk_id', 'done', 'results': [row | {'invoice', 'invoice_doctype', 'error'}], 'sent', 'failed',
+    'retrying', 'pending'}: `pending` counts invoices not sent yet; `done` is true when every company's job ended."""
+    header = frappe.cache.get_value(_bulk_key(bulk_id)) if isinstance(bulk_id, str) and bulk_id.isalnum() else None
+    if not header or (header.get('user') != frappe.session.user and frappe.session.user != 'Administrator'):
+        raise frappe.DoesNotExistError(_('Unknown bulk send'))
+
+    results, pending = list(header.get('refused') or []), 0
+    for company in header.get('companies') or []:
+        state = frappe.cache.get_value(_bulk_key(bulk_id, company)) or {}
+        rows = state.get('results') or []
+        results += rows
+        left = (state.get('invoices') or [])[len(rows) :]
+        if state.get('status') == 'done' or not left:
+            continue
+        if _bulk_job_alive(company):
+            pending += len(left)
+        else:
+            # The job is gone without finishing (worker lost, timeout): nothing more will come for these
+            results += [_bulk_error(n, header.get('invoice_doctype'), _('Not sent; try again')) for n in left]
+
+    counts = {'sent': 0, 'failed': 0, 'retrying': 0}
+    for row in results:
+        counts['failed' if 'error' in row else row.get('outcome') or 'failed'] += 1
+    return {'bulk_id': bulk_id, 'done': pending == 0, 'results': results, 'pending': pending, **counts}
+
+
+def _bulk_error(name, invoice_doctype, message) -> dict:
+    return {'invoice': name, 'invoice_doctype': invoice_doctype, 'error': message}
+
+
+def _bulk_job_id(company: str) -> str:
+    return f'ksa_compliance:zatca_bulk_send:{company}'
+
+
+def _bulk_job_alive(company: str) -> bool:
+    from frappe.utils.background_jobs import is_job_enqueued
+
+    return is_job_enqueued(_bulk_job_id(company))
+
+
+def _bulk_key(bulk_id: str, company: str | None = None) -> str:
+    return f'ksa_compliance:zatca_bulk:{bulk_id}' + (f':{company}' if company else '')
+
+
+def _bulk_put(bulk_id: str, company: str, state: dict) -> None:
+    frappe.cache.set_value(_bulk_key(bulk_id, company), state, expires_in_sec=BULK_STATUS_SECONDS)
 
 
 def _send_now(invoice: str, invoice_doctype: str) -> dict:
@@ -198,6 +321,7 @@ def _send_now(invoice: str, invoice_doctype: str) -> dict:
         'invoice_doctype': invoice_doctype,
         'siaf': result['siaf'],
         'sent': result['sent'],
+        'outcome': result['outcome'],
         'integration_status': result['integration_status'],
         'status_group': rules.status_group(result['integration_status']),
         'message': result['message'],
@@ -253,10 +377,9 @@ def get_sending_status(
         return empty
 
     inv = f'`tab{invoice_doctype}`'
+    col = _columns(invoice_doctype)
     values = {'doctype': invoice_doctype, 'companies': tuple(companies), 'start': start, 'page_length': page_length}
-    base = [f'{inv}.docstatus = 1', f'{inv}.company in %(companies)s']
-    if invoice_doctype == 'Sales Invoice':
-        base.append(f'ifnull({inv}.is_consolidated, 0) = 0')
+    base = [f'{inv}.docstatus = 1', f'{inv}.company in %(companies)s', *col['where']]
     if from_date:
         base.append(f'{inv}.posting_date >= %(from_date)s')
         values['from_date'] = getdate(from_date)
@@ -264,7 +387,7 @@ def get_sending_status(
         base.append(f'{inv}.posting_date <= %(to_date)s')
         values['to_date'] = getdate(to_date)
     if customer:
-        base.append(f'{inv}.customer = %(customer)s')
+        base.append(f'{col["customer"]} = %(customer)s')
         values['customer'] = customer
     if invoice_type:
         base.append('siaf.invoice_type_transaction like %(type_prefix)s')
@@ -292,12 +415,13 @@ def get_sending_status(
     page_where = where + (f' and {group_sql[status_group]}' if status_group else '')
     total = counts[status_group] if status_group else sum(counts.values())
     rows = frappe.db.sql(
-        f"""select {inv}.name as invoice, {inv}.company, {inv}.customer, {inv}.customer_name,
-                {inv}.posting_date, {inv}.posting_time, {inv}.grand_total, {inv}.currency,
+        f"""select {inv}.name as invoice, {inv}.company, {col['customer']} as customer,
+                {col['customer_name']} as customer_name, {inv}.posting_date, {col['posting_time']} as posting_time,
+                {col['grand_total']} as grand_total, {col['currency']} as currency,
                 siaf.name as siaf, siaf.docstatus as siaf_docstatus, siaf.integration_status,
                 siaf.invoice_type_transaction, siaf.last_attempt
             {joins} where {page_where}
-            order by {inv}.posting_date desc, {inv}.posting_time desc, {inv}.name desc
+            order by {inv}.posting_date desc, {col['posting_time']} desc, {inv}.name desc
             limit %(page_length)s offset %(start)s""",
         values,
         as_dict=True,
@@ -313,6 +437,30 @@ def get_sending_status(
         'near_deadline': near_deadline,
         'start': start,
         'page_length': page_length,
+    }
+
+
+def _columns(invoice_doctype: str) -> dict:
+    """SQL for the report's columns of each invoice doctype; a Payment Entry is listed only as a prepayment invoice."""
+    inv = f'`tab{invoice_doctype}`'
+    if invoice_doctype == 'Payment Entry':
+        return {
+            'customer': f'{inv}.party',
+            'customer_name': f'{inv}.party_name',
+            'posting_time': 'null',
+            'grand_total': f'{inv}.paid_amount',
+            'currency': f'{inv}.paid_from_account_currency',
+            'issued_at': f'timestamp({inv}.posting_date)',
+            'where': [f'ifnull({inv}.custom_prepayment_invoice, 0) = 1', f"{inv}.party_type = 'Customer'"],
+        }
+    return {
+        'customer': f'{inv}.customer',
+        'customer_name': f'{inv}.customer_name',
+        'posting_time': f'{inv}.posting_time',
+        'grand_total': f'{inv}.grand_total',
+        'currency': f'{inv}.currency',
+        'issued_at': f'timestamp({inv}.posting_date, {inv}.posting_time)',
+        'where': [f'ifnull({inv}.is_consolidated, 0) = 0'] if invoice_doctype == 'Sales Invoice' else [],
     }
 
 
@@ -370,15 +518,16 @@ def _issued_at(posting_date, posting_time) -> Optional[datetime.datetime]:
 def _count_near_deadline(invoice_doctype, companies, customer, match, now) -> int:
     """Pending simplified invoices at or past the alert threshold (whatever their date), under the same permissions."""
     inv = f'`tab{invoice_doctype}`'
+    col = _columns(invoice_doctype)
     values = {
         'doctype': invoice_doctype,
         'companies': tuple(companies),
         'cutoff': rules.alert_cutoff(now),
         'pending': rules.PENDING_STATUSES,
     }
-    conds = ''
+    conds = ''.join(f' and {w}' for w in col['where'])
     if customer:
-        conds = f' and {inv}.customer = %(customer)s'
+        conds += f' and {col["customer"]} = %(customer)s'
         values['customer'] = customer
     return cint(
         frappe.db.sql(
@@ -386,7 +535,7 @@ def _count_near_deadline(invoice_doctype, companies, customer, match, now) -> in
                 and siaf.invoice_doctype = %(doctype)s and siaf.is_latest = 1
             where {inv}.docstatus = 1 and {inv}.company in %(companies)s and siaf.docstatus = 0
                 and siaf.integration_status in %(pending)s and siaf.invoice_type_transaction like '02%%'
-                and timestamp({inv}.posting_date, {inv}.posting_time) <= %(cutoff)s{conds}{match}""",
+                and {col['issued_at']} <= %(cutoff)s{conds}{match}""",
             values,
         )[0][0]
     )
@@ -521,13 +670,19 @@ def alert_near_reporting_limit() -> None:
     candidates = find_near_deadline(now)
     recipients: dict[str, list[str]] = {}
     for row in candidates:
-        if row.company not in recipients:
-            recipients[row.company] = alert_recipients(row.company)
-        users = recipients[row.company]
-        if users:
-            _notify(row, users, now)
-        frappe.db.set_value(SIAF, row.siaf, 'deadline_alert_sent', 1, update_modified=False)
-        frappe.db.commit()
+        # One row's failure must not stop the rest: rows come oldest first, so it would fail first on every run and
+        # no later invoice would ever be alerted on. It stays unmarked and is tried again next run.
+        try:
+            if row.company not in recipients:
+                recipients[row.company] = alert_recipients(row.company)
+            users = recipients[row.company]
+            if users:
+                _notify(row, users, now)
+            frappe.db.set_value(SIAF, row.siaf, 'deadline_alert_sent', 1, update_modified=False)
+            frappe.db.commit()
+        except Exception:
+            frappe.db.rollback()
+            logger.error(f'Could not alert on {row.invoice_doctype} {row.invoice} ({row.siaf})', exc_info=True)
 
 
 def find_near_deadline(now: datetime.datetime) -> list:

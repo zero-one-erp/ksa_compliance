@@ -111,5 +111,36 @@ class TestReportingLimitAlert(unittest.TestCase):
         self.assertEqual(rules.hours_left(D(2026, 11, 26, 10, 0), self.NOW), -2.0)
 
 
+class TestSendOutcome(unittest.TestCase):
+    """A send's outcome follows the status it stored, not the Ok the submit path answers for every ZATCA reply."""
+
+    def test_only_accepted_statuses_count_as_sent(self):
+        for status in rules.SENT_STATUSES:
+            self.assertEqual(rules.send_outcome(status), 'sent', status)
+
+    def test_final_refusals_are_failed(self):
+        for status in ('Rejected', 'Duplicate', 'Clearance switched off'):
+            self.assertEqual(rules.send_outcome(status), 'failed', status)
+
+    def test_still_pending_is_retrying(self):
+        for status in (*rules.PENDING_STATUSES, '', None):
+            self.assertEqual(rules.send_outcome(status), 'retrying', status)
+
+
+class TestTransactionFromXml(unittest.TestCase):
+    """Device-computed invoices carry their type only in the signed XML (BR-KSA-06, InvoiceTypeCode/@name)."""
+
+    def test_reads_the_name_of_invoice_type_code(self):
+        xml = '<Invoice><cbc:ID>1</cbc:ID><cbc:InvoiceTypeCode name="0100000">388</cbc:InvoiceTypeCode></Invoice>'
+        self.assertEqual(rules.transaction_from_xml(xml), '0100000')
+        self.assertTrue(rules.is_standard_transaction(rules.transaction_from_xml(xml)))
+        single = "<InvoiceTypeCode listID='x' name='0200100'>381</InvoiceTypeCode>"
+        self.assertEqual(rules.transaction_from_xml(single), '0200100')
+
+    def test_none_without_a_type(self):
+        for xml in (None, '', '<Invoice/>', '<cbc:InvoiceTypeCode>388</cbc:InvoiceTypeCode>'):
+            self.assertIsNone(rules.transaction_from_xml(xml), xml)
+
+
 if __name__ == '__main__':
     unittest.main()

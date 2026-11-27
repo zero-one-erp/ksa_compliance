@@ -17,7 +17,12 @@ from ksa_compliance import zatca_sending
 from ksa_compliance.ksa_compliance.doctype.sales_invoice_additional_fields.sales_invoice_additional_fields import (
     SalesInvoiceAdditionalFields,
 )
+from ksa_compliance.ksa_compliance.doctype.sales_invoice_additional_fields import (
+    sales_invoice_additional_fields as siaf_module,
+)
+from ksa_compliance.invoice import InvoiceMode
 from ksa_compliance.standard_doctypes import sales_invoice as si_hooks
+from ksa_compliance.standard_doctypes.payment_entry import payment_entry as pe_hooks
 
 SIAF = 'Sales Invoice Additional Fields'
 COMPANY = '_ZS Company'
@@ -32,9 +37,18 @@ def _invoice(name, posted_at: datetime.datetime, customer=CUSTOMER, company=COMP
     doc.db_insert()
 
 
-def _siaf(name, invoice, status, docstatus=0, transaction='0200000', latest=1):
+def _prepayment(name, posted_at: datetime.datetime, customer=CUSTOMER, company=COMPANY, prepayment=1):
+    doc = frappe.new_doc('Payment Entry')
+    doc.name, doc.company, doc.payment_type, doc.party_type = name, company, 'Receive', 'Customer'
+    doc.party, doc.party_name, doc.posting_date = customer, customer, posted_at.date()
+    doc.docstatus, doc.paid_amount, doc.received_amount, doc.paid_from_account_currency = 1, 115, 115, 'SAR'
+    doc.custom_prepayment_invoice = prepayment
+    doc.db_insert()
+
+
+def _siaf(name, invoice, status, docstatus=0, transaction='0200000', latest=1, doctype='Sales Invoice'):
     doc = frappe.new_doc(SIAF)
-    doc.name, doc.sales_invoice, doc.invoice_doctype = name, invoice, 'Sales Invoice'
+    doc.name, doc.sales_invoice, doc.invoice_doctype = name, invoice, doctype
     doc.integration_status, doc.docstatus, doc.is_latest, doc.invoice_type_transaction = (
         status,
         docstatus,
@@ -235,20 +249,232 @@ class TestSendNow(_SendingTestCase):
         finally:
             frappe.set_user('Administrator')
 
-    def test_bulk_reports_each_invoice_and_is_capped(self):
+    def _reply(self, status, docstatus):
+        """A submit_to_zatca that stores what ZATCA answered and returns Ok, as the real one does for every reply."""
+
+        def submit(doc):
+            doc.integration_status = status
+            frappe.db.set_value(SIAF, doc.name, {'integration_status': status, 'docstatus': docstatus})
+            return Ok(f'Invoice sent to ZATCA. Integration status: {status}')
+
+        return submit
+
+    def test_the_answer_follows_the_stored_status(self):
+        cases = (
+            ('Accepted', 1, True, 'sent', 'sent'),
+            ('Accepted with warnings', 1, True, 'sent', 'sent'),
+            ('Rejected', 1, False, 'failed', 'failed'),
+            ('Duplicate', 1, False, 'failed', 'failed'),
+            ('Resend', 0, False, 'retrying', 'not_sent'),
+        )
+        for status, docstatus, sent, outcome, group in cases:
+            frappe.db.set_value(SIAF, '_ZS-SIAF-1', {'integration_status': 'Ready For Batch', 'docstatus': 0})
+            with mock.patch.object(
+                SalesInvoiceAdditionalFields,
+                'submit_to_zatca',
+                autospec=True,
+                side_effect=self._reply(status, docstatus),
+            ):
+                result = zatca_sending.send_now('_ZS-INV-1')
+            self.assertEqual(
+                (result['sent'], result['outcome'], result['status_group'], result['integration_status']),
+                (sent, outcome, group, status),
+                status,
+            )
+            self.assertEqual(frappe.db.get_value(SIAF, '_ZS-SIAF-1', 'integration_status'), status)
+
+    def test_an_exception_leaves_it_pending_and_says_so(self):
+        with mock.patch.object(
+            SalesInvoiceAdditionalFields, 'submit_to_zatca', side_effect=RuntimeError('token=abc123 connection reset')
+        ):
+            result = zatca_sending.send_now('_ZS-INV-1')
+        self.assertEqual((result['sent'], result['outcome'], result['status_group']), (False, 'retrying', 'not_sent'))
+        self.assertNotIn('abc123', str(result))  # the exception text stays in the log
+        self.assertEqual(
+            frappe.db.get_value(SIAF, '_ZS-SIAF-1', ['integration_status', 'docstatus']), ('Ready For Batch', 0)
+        )
+
+    def test_the_document_is_read_for_update_inside_the_lock(self):
+        real_get_doc = frappe.get_doc
+        with (
+            mock.patch.object(zatca_sending.frappe, 'get_doc', side_effect=real_get_doc) as get_doc,
+            mock.patch.object(SalesInvoiceAdditionalFields, 'submit_to_zatca', autospec=True, side_effect=self._accept),
+        ):
+            zatca_sending.send_now('_ZS-INV-1')
+        get_doc.assert_any_call(SIAF, '_ZS-SIAF-1', for_update=True)
+
+    def test_bulk_queues_one_job_per_company_and_returns_at_once(self):
         _invoice('_ZS-INV-2', now_datetime())
-        _siaf('_ZS-SIAF-2', '_ZS-INV-2', 'Rejected', docstatus=1)
+        _siaf('_ZS-SIAF-2', '_ZS-INV-2', 'Ready For Batch')
+        _invoice('_ZS-INV-B', now_datetime(), company='_ZS Company B')
+        _siaf('_ZS-SIAF-B', '_ZS-INV-B', 'Ready For Batch')
+        with (
+            mock.patch('frappe.utils.background_jobs.enqueue', return_value=mock.MagicMock()) as enqueue,
+            mock.patch.object(SalesInvoiceAdditionalFields, 'submit_to_zatca') as submit,
+        ):
+            queued = zatca_sending.send_now_bulk(frappe.as_json(['_ZS-INV-1', '_ZS-INV-B', '_ZS-INV-2', '_ZS-NONE']))
+        submit.assert_not_called()  # nothing is sent inside the request
+        calls = {c.kwargs['company']: c.kwargs for c in enqueue.call_args_list}
+        self.assertEqual(len(enqueue.call_args_list), 2)
+        self.assertEqual(calls[COMPANY]['invoices'], ['_ZS-INV-1', '_ZS-INV-2'])
+        self.assertEqual(calls['_ZS Company B']['invoices'], ['_ZS-INV-B'])
+        self.assertTrue(all(c['deduplicate'] for c in calls.values()))
+        self.assertNotEqual(calls[COMPANY]['job_id'], calls['_ZS Company B']['job_id'])
+        self.assertEqual([r['invoice'] for r in queued['refused']], ['_ZS-NONE'])
+
+        # The job of one company runs; the other company's job is gone without running
         with mock.patch.object(
             SalesInvoiceAdditionalFields, 'submit_to_zatca', autospec=True, side_effect=self._accept
         ):
-            result = zatca_sending.send_now_bulk(frappe.as_json(['_ZS-INV-1', '_ZS-INV-2', '_ZS-NONE']))
-        self.assertEqual((result['sent'], result['failed']), (1, 2))
-        self.assertTrue(result['results'][0]['sent'])
-        self.assertIn('error', result['results'][1])
-        self.assertIn('error', result['results'][2])
+            zatca_sending.send_now_bulk_job(queued['bulk_id'], COMPANY, ['_ZS-INV-1', '_ZS-INV-2'], 'Sales Invoice')
+        with mock.patch.object(zatca_sending, '_bulk_job_alive', return_value=True):
+            running = zatca_sending.get_bulk_send_status(queued['bulk_id'])
+        self.assertEqual((running['done'], running['pending'], running['sent']), (False, 1, 2))
+        with mock.patch.object(zatca_sending, '_bulk_job_alive', return_value=False):
+            status = zatca_sending.get_bulk_send_status(queued['bulk_id'])
+        self.assertTrue(status['done'])
+        self.assertEqual((status['sent'], status['failed'], status['retrying']), (2, 2, 0))
 
+        # Another user cannot read it
+        frappe.set_user('Guest')
+        try:
+            with self.assertRaises(frappe.DoesNotExistError):
+                zatca_sending.get_bulk_send_status(queued['bulk_id'])
+        finally:
+            frappe.set_user('Administrator')
+
+    def test_bulk_counts_an_invoice_another_sender_holds_as_retrying(self):
+        with mock.patch('frappe.utils.background_jobs.enqueue', return_value=mock.MagicMock()):
+            queued = zatca_sending.send_now_bulk(['_ZS-INV-1'])
+        with zatca_sending._send_lock('_ZS-SIAF-1'):
+            zatca_sending.send_now_bulk_job(queued['bulk_id'], COMPANY, ['_ZS-INV-1'], 'Sales Invoice')
+        status = zatca_sending.get_bulk_send_status(queued['bulk_id'])
+        self.assertEqual((status['done'], status['sent'], status['failed'], status['retrying']), (True, 0, 0, 1))
+
+    def test_bulk_refuses_a_company_whose_bulk_send_is_running(self):
+        with mock.patch('frappe.utils.background_jobs.enqueue', return_value=None):  # deduplicated: still running
+            queued = zatca_sending.send_now_bulk(['_ZS-INV-1'])
+        self.assertEqual(queued['jobs'], [])
+        self.assertEqual([r['invoice'] for r in queued['refused']], ['_ZS-INV-1'])
+
+    def test_bulk_is_capped(self):
         with self.assertRaises(frappe.ValidationError):
             zatca_sending.send_now_bulk([f'_ZS-{i}' for i in range(zatca_sending.BULK_LIMIT + 1)])
+
+
+class TestPrepayments(_SendingTestCase):
+    def _submit(self, sync_with_zatca, transaction):
+        entry = frappe._dict(
+            doctype='Payment Entry', name='_ZS-PE-SUBMIT', company=COMPANY, custom_prepayment_invoice=1
+        )
+        settings = frappe._dict(enable_zatca_integration=1, sync_with_zatca=sync_with_zatca)
+        siaf = mock.MagicMock(invoice_type_transaction=transaction)
+        siaf.name = '_ZS-SIAF-PE-SUBMIT'
+        with (
+            mock.patch.object(pe_hooks.ZATCABusinessSettings, 'for_invoice', return_value=settings),
+            mock.patch.object(pe_hooks.SalesInvoiceAdditionalFields, 'create_for_invoice', return_value=siaf),
+            mock.patch.object(pe_hooks.frappe.utils.background_jobs, 'enqueue') as enqueue,
+        ):
+            pe_hooks.create_prepayment_invoice_additional_fields_doctype(entry, 'on_submit')
+        siaf.insert.assert_called_once()
+        return enqueue
+
+    def test_a_prepayment_goes_through_the_locked_path(self):
+        enqueue = self._submit('Batches', '0100000')  # standard: cleared at once whatever the mode
+        enqueue.assert_called_once_with(
+            'ksa_compliance.zatca_sending.send_pending_job', siaf_name='_ZS-SIAF-PE-SUBMIT', enqueue_after_commit=True
+        )
+        self.assertFalse(self._submit('Every 24 hours', '0200000').called)
+        self.assertTrue(self._submit('Live', '0200000').called)
+
+    def test_the_prepayment_send_takes_the_lock(self):
+        _prepayment('_ZS-PE-1', now_datetime())
+        _siaf('_ZS-SIAF-PE-1', '_ZS-PE-1', 'Ready For Batch', doctype='Payment Entry')
+        with zatca_sending._send_lock('_ZS-SIAF-PE-1') as held:
+            self.assertTrue(held)
+            with mock.patch.object(SalesInvoiceAdditionalFields, 'submit_to_zatca') as submit:
+                zatca_sending.send_pending_job('_ZS-SIAF-PE-1')
+                # a job enqueued before the upgrade, by the old function
+                pe_hooks._submit_additional_fields(frappe.get_doc(SIAF, '_ZS-SIAF-PE-1'))
+                siaf_module._submit_additional_fields(frappe.get_doc(SIAF, '_ZS-SIAF-PE-1'))
+                with self.assertRaises(zatca_sending.ZatcaSendInProgress):
+                    zatca_sending.send_now('_ZS-PE-1', 'Payment Entry')
+            submit.assert_not_called()
+
+    def test_prepayments_are_listed_and_sent_now(self):
+        _prepayment('_ZS-PE-2', now_datetime() - datetime.timedelta(days=1))
+        _siaf('_ZS-SIAF-PE-2', '_ZS-PE-2', 'Ready For Batch', doctype='Payment Entry')
+        _prepayment('_ZS-PE-PLAIN', now_datetime(), prepayment=0)  # an ordinary payment: not an invoice
+        result = zatca_sending.get_sending_status(invoice_doctype='Payment Entry', company=COMPANY)
+        names = [r['invoice'] for r in result['data'] if r['invoice'].startswith('_ZS-')]
+        self.assertEqual(names, ['_ZS-PE-2'])
+        row = result['data'][[r['invoice'] for r in result['data']].index('_ZS-PE-2')]
+        self.assertEqual((row['customer'], row['status_group'], row['can_send']), (CUSTOMER, 'not_sent', True))
+        self.assertTrue(row['near_deadline'])  # issued at midnight a day ago
+
+        def accept(doc):
+            frappe.db.set_value(SIAF, doc.name, {'integration_status': 'Accepted', 'docstatus': 1})
+            return Ok('Accepted')
+
+        with mock.patch.object(SalesInvoiceAdditionalFields, 'submit_to_zatca', autospec=True, side_effect=accept):
+            sent = zatca_sending.send_now('_ZS-PE-2', 'Payment Entry')
+        self.assertEqual((sent['sent'], sent['outcome']), (True, 'sent'))
+
+    def test_prepayment_send_now_checks_permissions(self):
+        _prepayment('_ZS-PE-3', now_datetime())
+        _siaf('_ZS-SIAF-PE-3', '_ZS-PE-3', 'Ready For Batch', doctype='Payment Entry')
+        frappe.set_user('Guest')
+        try:
+            with mock.patch.object(SalesInvoiceAdditionalFields, 'submit_to_zatca') as submit:
+                with self.assertRaises(frappe.PermissionError):
+                    zatca_sending.send_now('_ZS-PE-3', 'Payment Entry')
+            submit.assert_not_called()
+        finally:
+            frappe.set_user('Administrator')
+
+
+class TestPrecomputedType(_SendingTestCase):
+    def _precomputed(self, xml):
+        _invoice('_ZS-PRE-INV', now_datetime())
+        doc = frappe.new_doc(SIAF)
+        doc.sales_invoice, doc.invoice_doctype, doc.precomputed, doc.invoice_xml = (
+            '_ZS-PRE-INV',
+            'Sales Invoice',
+            1,
+            xml,
+        )
+        doc.before_insert()
+        return doc
+
+    def test_the_type_comes_from_the_device_xml(self):
+        doc = self._precomputed('<Invoice><cbc:InvoiceTypeCode name="0100000">388</cbc:InvoiceTypeCode></Invoice>')
+        self.assertEqual(doc.invoice_type_transaction, '0100000')
+
+    def test_without_one_in_the_xml_the_settings_decide(self):
+        settings = frappe._dict(invoice_mode=InvoiceMode.Standard)
+        with (
+            mock.patch.object(siaf_module.ZATCABusinessSettings, 'for_invoice', return_value=settings),
+            mock.patch.object(SalesInvoiceAdditionalFields, '_get_buyer_doc', return_value=None),
+            mock.patch.object(siaf_module, '_check_invoice_for_export', return_value=False),
+        ):
+            doc = self._precomputed('<Invoice/>')
+        self.assertEqual(doc.invoice_type_transaction, '0100000')
+
+
+class TestPrecomputedBackfill(_SendingTestCase):
+    def test_pending_precomputed_rows_get_their_type_from_the_xml(self):
+        from ksa_compliance.patches import _2026_11_28_backfill_precomputed_invoice_type as patch
+
+        _invoice('_ZS-PRE-OLD', now_datetime())
+        _siaf('_ZS-SIAF-PRE-OLD', '_ZS-PRE-OLD', 'Ready For Batch', transaction='')
+        _invoice('_ZS-PRE-DONE', now_datetime())
+        _siaf('_ZS-SIAF-PRE-DONE', '_ZS-PRE-DONE', 'Accepted', docstatus=1, transaction='')
+        xml = '<Invoice><cbc:InvoiceTypeCode name="0100000">388</cbc:InvoiceTypeCode></Invoice>'
+        for name in ('_ZS-SIAF-PRE-OLD', '_ZS-SIAF-PRE-DONE'):
+            frappe.db.set_value(SIAF, name, {'precomputed': 1, 'invoice_xml': xml}, update_modified=False)
+        patch.execute()
+        self.assertEqual(frappe.db.get_value(SIAF, '_ZS-SIAF-PRE-OLD', 'invoice_type_transaction'), '0100000')
+        self.assertFalse(frappe.db.get_value(SIAF, '_ZS-SIAF-PRE-DONE', 'invoice_type_transaction'))  # final: left
 
 
 class TestStatusList(_SendingTestCase):
@@ -331,3 +557,25 @@ class TestReportingLimitAlert(_SendingTestCase):
         self.assertEqual(alerted, ['_ZS-OLD'])
         self.assertEqual(frappe.db.get_value(SIAF, '_ZS-SIAF-OLD', 'deadline_alert_sent'), 1)
         self.assertEqual(frappe.db.get_value(SIAF, '_ZS-SIAF-NEW', 'deadline_alert_sent'), 0)
+
+    def test_one_failing_row_does_not_stop_the_rest(self):
+        now = now_datetime()
+        _invoice('_ZS-OLD-A', now - datetime.timedelta(hours=23))
+        _siaf('_ZS-SIAF-OLD-A', '_ZS-OLD-A', 'Ready For Batch')
+        _invoice('_ZS-OLD-B', now - datetime.timedelta(hours=21))
+        _siaf('_ZS-SIAF-OLD-B', '_ZS-OLD-B', 'Ready For Batch')
+
+        def notify(row, users, at):
+            if row.invoice == '_ZS-OLD-A':
+                raise RuntimeError('notification log full')
+
+        with (
+            mock.patch.object(zatca_sending, 'alert_recipients', return_value=['Administrator']),
+            mock.patch.object(zatca_sending, '_notify', side_effect=notify) as notified,
+        ):
+            zatca_sending.alert_near_reporting_limit()
+
+        tried = [c.args[0].invoice for c in notified.call_args_list if c.args[0].invoice.startswith('_ZS')]
+        self.assertEqual(tried, ['_ZS-OLD-A', '_ZS-OLD-B'])
+        self.assertEqual(frappe.db.get_value(SIAF, '_ZS-SIAF-OLD-A', 'deadline_alert_sent'), 0)  # tried again later
+        self.assertEqual(frappe.db.get_value(SIAF, '_ZS-SIAF-OLD-B', 'deadline_alert_sent'), 1)

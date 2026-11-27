@@ -15,6 +15,12 @@ to a section with the version name.
 * «Send now» for one invoice or up to 100 (`ksa_compliance.zatca_sending.send_now` / `send_now_bulk`), a paginated
   status list (`get_sending_status`), and an alert 20 hours after issue for simplified invoices not yet reported.
 * Every sender goes through one locked path, so an invoice is never sent twice at once.
+* Security review fixes (ZR-873): «send now» reports `sent` only when ZATCA accepted the invoice (`outcome`: sent /
+  failed / retrying, from the stored status); bulk «send now» runs as one background job per company
+  (`get_bulk_send_status` for progress, one bulk job per company at a time); device-computed invoices store their
+  invoice type, so standard ones clear at once and show in the type filter and the 24 hour alert; prepayment invoices
+  (Payment Entry) follow the same send rule and lock and appear in the status list and «send now»; the send re-reads
+  the document for update inside the lock; one failing alert no longer stops the others.
 
 ## ZerOne 0.61.13 — 2026-10-29
 

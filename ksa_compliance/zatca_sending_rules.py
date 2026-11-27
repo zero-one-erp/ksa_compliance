@@ -15,6 +15,7 @@ raise an alert.
 from __future__ import annotations
 
 import datetime
+import re
 from typing import Literal, Optional
 
 MODE_LIVE = 'Live'
@@ -29,6 +30,11 @@ PENDING_STATUSES = ('Ready For Batch', 'Resend', 'Corrected')
 SENT_STATUSES = ('Accepted', 'Accepted with warnings')
 # Anything else a submitted additional fields document can carry is final: sending it again is refused
 FAILED_STATUSES = ('Rejected', 'Duplicate', 'Clearance switched off')
+
+# What a send came to, from the status it left stored: ZATCA took it, ZATCA refused it for good, or it is still
+# pending and a later run tries again (Resend after a network or 5xx error, missing settings, an exception)
+SendOutcome = Literal['sent', 'failed', 'retrying']
+SEND_OUTCOMES = ('sent', 'failed', 'retrying')
 
 StatusGroup = Literal['sent', 'not_sent', 'failed']
 STATUS_GROUPS = ('sent', 'not_sent', 'failed')
@@ -51,6 +57,25 @@ def normalize_mode(value: Optional[str]) -> str:
 def is_standard_transaction(invoice_type_transaction: Optional[str]) -> bool:
     """Whether an additional fields' invoice type transaction ('0100000' / '0200000', BR-KSA-06) is a standard one."""
     return (invoice_type_transaction or '').startswith('01')
+
+
+_INVOICE_TYPE_CODE_NAME = re.compile(r'<(?:\w+:)?InvoiceTypeCode\b[^>]*?\bname\s*=\s*["\'](\d{7})["\']')
+
+
+def transaction_from_xml(invoice_xml: Optional[str]) -> Optional[str]:
+    """The invoice type transaction ('0100000', '0200000', ...) an invoice's XML names in InvoiceTypeCode/@name, or
+    None. Device-computed invoices carry it only there."""
+    match = _INVOICE_TYPE_CODE_NAME.search(invoice_xml or '')
+    return match.group(1) if match else None
+
+
+def send_outcome(integration_status: Optional[str]) -> SendOutcome:
+    """What a send came to, judged by the status it stored (submit_to_zatca answers Ok for every reply ZATCA gave)."""
+    if integration_status in SENT_STATUSES:
+        return 'sent'
+    if not integration_status or integration_status in PENDING_STATUSES:
+        return 'retrying'
+    return 'failed'
 
 
 def send_on_submit(mode: Optional[str], is_standard: bool) -> bool:

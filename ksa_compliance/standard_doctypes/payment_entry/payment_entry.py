@@ -11,8 +11,8 @@ from erpnext.accounts.doctype.payment_entry.payment_entry import PaymentEntry
 from ksa_compliance import logger
 from ksa_compliance.throw import fthrow
 from ksa_compliance.translation import ft
-
-from result import is_ok
+from ksa_compliance.zatca_sending import send_pending
+from ksa_compliance.zatca_sending_rules import is_standard_transaction, send_on_submit
 
 
 def validate_payment_entry(self: PaymentEntry, method: str = None):
@@ -59,27 +59,24 @@ def create_prepayment_invoice_additional_fields_doctype(self: PaymentEntry, meth
         return
 
     prepayment_additional_fields_doc = SalesInvoiceAdditionalFields.create_for_invoice(self.name, self.doctype)
-    is_live_sync = settings.is_live_sync
     prepayment_additional_fields_doc.insert()
 
-    if is_live_sync:
+    # As for sales invoices: a standard (B2B) prepayment is cleared at once whatever the mode, a simplified one follows
+    # the mode; either way through the one locked send path
+    is_standard = is_standard_transaction(prepayment_additional_fields_doc.invoice_type_transaction)
+    if send_on_submit(settings.sync_with_zatca, is_standard):
         # We're running in the context of invoice submission (on_submit hook). We only want to run our ZATCA logic if
         # the invoice submits successfully after on_submit is run successfully from all apps.
         frappe.utils.background_jobs.enqueue(
-            _submit_additional_fields, doc=prepayment_additional_fields_doc, enqueue_after_commit=True
+            'ksa_compliance.zatca_sending.send_pending_job',
+            siaf_name=prepayment_additional_fields_doc.name,
+            enqueue_after_commit=True,
         )
 
 
 def _submit_additional_fields(doc: SalesInvoiceAdditionalFields):
-    current_modified = frappe.db.get_value('Sales Invoice Additional Fields', doc.name, 'modified')
-    if current_modified and str(current_modified) != str(doc.modified):
-        logger.info(f'Reloading {doc.name} because it was modified after enqueue')
-        doc.reload()
-
-    logger.info(f'Submitting {doc.name}')
-    result = doc.submit_to_zatca()
-    message = result.ok_value if is_ok(result) else result.err_value
-    logger.info(f'Submission result: {message}')
+    # Kept for jobs enqueued before an upgrade; they go through the locked path by name, like new ones.
+    send_pending(doc.name)
 
 
 def prevent_cancellation_of_prepayment_invoice(self: PaymentEntry, method):
