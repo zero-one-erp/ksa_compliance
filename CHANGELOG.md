@@ -8,6 +8,14 @@ to a section with the version name.
 
 ## Unreleased Changes
 
+* Standard (B2B) invoices are cleared with ZATCA on submission whatever `Sync with ZATCA` says.
+* `Sync with ZATCA` gains `At a set time` (daily, at `Sending Time`) and `Every 24 hours` for simplified invoices;
+  `Batches` keeps its hourly behaviour. Under the new modes the hourly job still retries failed sends and sends any
+  simplified invoice 20 hours after its issue.
+* «Send now» for one invoice or up to 100 (`ksa_compliance.zatca_sending.send_now` / `send_now_bulk`), a paginated
+  status list (`get_sending_status`), and an alert 20 hours after issue for simplified invoices not yet reported.
+* Every sender goes through one locked path, so an invoice is never sent twice at once.
+
 ## 0.61.9
 
 Contributed by [Yamen Afifi](https://github.com/yamenafifi)

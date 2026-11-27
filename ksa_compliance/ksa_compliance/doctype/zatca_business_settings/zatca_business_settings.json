@@ -16,6 +16,8 @@
   "country_code",
   "enable_zatca_integration",
   "sync_with_zatca",
+  "sync_time",
+  "last_scheduled_sync",
   "type_of_business_transactions",
   "currency",
   "column_break_kjzc",
@@ -192,7 +194,8 @@
    "fieldname": "sync_with_zatca",
    "fieldtype": "Select",
    "label": "Sync with ZATCA",
-   "options": "Live\nBatches"
+   "options": "Live\nBatches\nAt a set time\nEvery 24 hours",
+   "description": "How simplified invoices are reported. Standard invoices are always cleared at once. Live: on submission. Batches: every hour. At a set time: daily at the time below. Every 24 hours: a day after the previous run."
   },
   {
    "fieldname": "tab_break_ljdo",
@@ -517,11 +520,27 @@
    "fieldname": "column_break_izkt",
    "fieldtype": "Column Break",
    "no_copy": 1
+  },
+  {
+   "depends_on": "eval:doc.sync_with_zatca==\"At a set time\"",
+   "description": "In the site's time zone",
+   "fieldname": "sync_time",
+   "fieldtype": "Time",
+   "label": "Sending Time",
+   "mandatory_depends_on": "eval:doc.sync_with_zatca==\"At a set time\""
+  },
+  {
+   "depends_on": "eval:[\"At a set time\", \"Every 24 hours\"].includes(doc.sync_with_zatca)",
+   "fieldname": "last_scheduled_sync",
+   "fieldtype": "Datetime",
+   "label": "Last Scheduled Sending",
+   "no_copy": 1,
+   "read_only": 1
   }
  ],
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2025-05-20 11:06:24.795298",
+ "modified": "2026-11-27 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "KSA Compliance",
  "name": "ZATCA Business Settings",

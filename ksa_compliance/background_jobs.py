@@ -5,12 +5,10 @@ import frappe
 from frappe.query_builder import DocType
 from pypika import Order
 from pypika.queries import QueryBuilder
-from result import is_ok
 
 from ksa_compliance import logger
-from ksa_compliance.ksa_compliance.doctype.sales_invoice_additional_fields.sales_invoice_additional_fields import (
-    SalesInvoiceAdditionalFields,
-)
+from ksa_compliance.zatca_sending_rules import PENDING_STATUSES
+from ksa_compliance.zatca_sending import ModeResolver, send_pending, should_send_in_run
 
 
 @frappe.whitelist()
@@ -31,10 +29,20 @@ def add_batch_to_background_queue(check_date=datetime.date.today()):
 
 
 def sync_e_invoices(
-    check_date: Optional[datetime.datetime | datetime.date] = None, batch_size: int = 100, dry_run: bool = False
+    check_date: Optional[datetime.datetime | datetime.date] = None,
+    batch_size: int = 100,
+    dry_run: bool = False,
+    companies: Optional[list[str]] = None,
 ):
+    """Sends pending additional fields to ZATCA.
+
+    Without `companies` this is the hourly run: it sends standard invoices, and simplified ones whose company sends
+    live or in (legacy) batches; under a scheduled mode it only retries simplified ones already attempted. With
+    `companies` it is those companies' scheduled run and sends everything they have pending."""
     prefix = '[Dry run] ' if dry_run else ''
-    logger.info(f'{prefix}Syncing with ZATCA in batches of {batch_size}')
+    run = f'scheduled run for {companies}' if companies is not None else 'hourly run'
+    logger.info(f'{prefix}Syncing with ZATCA in batches of {batch_size} ({run})')
+    resolver = ModeResolver()
     if check_date:
         logger.info(f'{prefix}Limiting sync to >= date: {check_date}')
 
@@ -64,17 +72,16 @@ def sync_e_invoices(
 
         for doc in additional_field_docs:
             try:
+                if not should_send_in_run(doc, resolver, companies):
+                    continue
+
                 logger.info(f'{prefix}Submitting {doc.name}')
                 if dry_run:
                     continue
 
-                adf_doc = cast(
-                    SalesInvoiceAdditionalFields, frappe.get_doc('Sales Invoice Additional Fields', doc.name)
-                )
-                result = adf_doc.submit_to_zatca()
-                message = result.ok_value if is_ok(result) else result.err_value
-                logger.info(f'{prefix}{doc.name}: {message}')
-                frappe.db.commit()
+                # Locked, re-checked and committed: a send already running elsewhere is skipped, not repeated
+                result = send_pending(doc.name)
+                logger.info(f'{prefix}{doc.name}: {result["message"]}')
             except Exception:
                 logger.error(f'{prefix}Error submitting {doc.name}', exc_info=True)
                 frappe.db.rollback()
@@ -83,11 +90,19 @@ def sync_e_invoices(
 
 
 def build_query(check_date: Optional[datetime.datetime], limit: int) -> QueryBuilder:
-    batch_status = ['Ready For Batch', 'Resend', 'Corrected']
+    batch_status = list(PENDING_STATUSES)
     doctype = DocType('Sales Invoice Additional Fields')
     query = (
         frappe.qb.from_(doctype)
-        .select(doctype.name, doctype.creation)
+        .select(
+            doctype.name,
+            doctype.creation,
+            doctype.invoice_doctype,
+            doctype.sales_invoice,
+            doctype.integration_status,
+            doctype.invoice_type_transaction,
+            doctype.precomputed_invoice,
+        )
         .where((doctype.integration_status.isin(batch_status)) & (doctype.docstatus == 0))
     )
     if check_date:

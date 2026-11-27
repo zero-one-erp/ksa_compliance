@@ -13,6 +13,7 @@
   "amended_from",
   "integration_status",
   "last_attempt",
+  "deadline_alert_sent",
   "invoice_doctype",
   "sales_invoice",
   "is_latest",
@@ -643,6 +644,16 @@
    "hidden": 1,
    "label": "Allow Submit",
    "read_only": 1
+  },
+  {
+   "default": "0",
+   "description": "Set once the alert before the 24 hour reporting limit was sent",
+   "fieldname": "deadline_alert_sent",
+   "fieldtype": "Check",
+   "hidden": 1,
+   "label": "Reporting Deadline Alert Sent",
+   "no_copy": 1,
+   "read_only": 1
   }
  ],
  "index_web_pages_for_search": 1,
@@ -653,7 +664,7 @@
    "link_fieldname": "invoice_additional_fields_reference"
   }
  ],
- "modified": "2026-02-03 15:16:56.510792",
+ "modified": "2026-11-27 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "KSA Compliance",
  "name": "Sales Invoice Additional Fields",

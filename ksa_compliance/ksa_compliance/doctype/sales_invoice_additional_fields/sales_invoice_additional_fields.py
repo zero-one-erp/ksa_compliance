@@ -82,6 +82,7 @@ class SalesInvoiceAdditionalFields(Document):
         charge_indicator: DF.Check
         charge_vat_category_code: DF.Data | None
         code_for_allowance_reason: DF.Data | None
+        deadline_alert_sent: DF.Check
         fatoora_invoice_discount_amount: DF.Float
         integration_status: DF.Literal[
             '',
@@ -666,8 +667,12 @@ def fix_rejection(id: str):
     new_siaf = SalesInvoiceAdditionalFields.create_for_invoice(siaf.sales_invoice, siaf.invoice_doctype)
     new_siaf.insert(ignore_permissions=True)
 
-    if settings.is_live_sync:
-        frappe.utils.background_jobs.enqueue(_submit_additional_fields, doc=new_siaf, enqueue_after_commit=True)
+    from ksa_compliance.zatca_sending_rules import is_standard_transaction, send_on_submit
+
+    if send_on_submit(settings.sync_with_zatca, is_standard_transaction(new_siaf.invoice_type_transaction)):
+        frappe.utils.background_jobs.enqueue(
+            'ksa_compliance.zatca_sending.send_pending_job', siaf_name=new_siaf.name, enqueue_after_commit=True
+        )
 
     frappe.msgprint(ft('Created $link', link=get_link_to_form('Sales Invoice Additional Fields', new_siaf.name)))
 
