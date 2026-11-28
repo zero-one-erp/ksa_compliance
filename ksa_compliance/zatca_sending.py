@@ -102,6 +102,9 @@ def send_pending(siaf_name: str) -> dict:
             return _send_result(siaf_name, status, _('Sending failed; it will be tried again'), None)
 
         status = frappe.db.get_value(SIAF, siaf_name, 'integration_status')
+        if is_ok(result):
+            # ZATCA answered: say so in the user's language (the submit path's own text is English, for the log)
+            message = _('Invoice sent to ZATCA. Integration status: {0}').format(_(status or ''))
         return _send_result(siaf_name, status, message, None)
 
 
@@ -130,8 +133,9 @@ def send_pending_job(siaf_name: str) -> None:
 def send_now(invoice: str, invoice_doctype: str = 'Sales Invoice') -> dict:
     """Sends one invoice's pending ZATCA additional fields now.
 
-    Throws if the caller may not read and submit the invoice, if it has nothing pending (its status is final), or if a
-    send is already running. Returns the invoice's row: {'invoice', 'invoice_doctype', 'siaf', 'sent', 'outcome',
+    Throws DoesNotExistError, the same for both, if the invoice does not exist or the caller may not read it;
+    PermissionError if the caller may not submit it; and ValidationError if it has nothing pending (its status is
+    final) or if a send is already running. Returns the invoice's row: {'invoice', 'invoice_doctype', 'siaf', 'sent', 'outcome',
     'integration_status', 'status_group', 'message'}: `sent` is true only when ZATCA accepted it; `outcome` is 'sent',
     'failed' (refused for good: Rejected, Duplicate, ...) or 'retrying' (still pending; a later run tries again)."""
     return _send_now(invoice, invoice_doctype)
@@ -285,10 +289,12 @@ def _send_now(invoice: str, invoice_doctype: str) -> dict:
     if invoice_doctype not in INVOICE_DOCTYPES:
         frappe.throw(_('Unsupported invoice type: {0}').format(invoice_doctype))
 
-    if not frappe.db.exists(invoice_doctype, invoice):
+    # An unknown invoice and one the caller may not read get the same answer, so it does not tell which exist (the
+    # bulk send answers the same way). Only a caller who can read it learns that submitting is not theirs.
+    if not frappe.db.exists(invoice_doctype, invoice) or not frappe.has_permission(
+        invoice_doctype, 'read', doc=invoice
+    ):
         raise frappe.DoesNotExistError(_('{0} {1} not found').format(_(invoice_doctype), invoice))
-
-    frappe.has_permission(invoice_doctype, 'read', doc=invoice, throw=True)
     frappe.has_permission(invoice_doctype, 'submit', doc=invoice, throw=True)
 
     siaf = frappe.db.get_value(
@@ -343,10 +349,15 @@ def get_sending_status(
     invoice_doctype: str = 'Sales Invoice',
     start: int | str = 0,
     page_length: int | str = 50,
+    near_deadline: int | str | bool = 0,
+    sort: str = 'newest',
 ) -> dict:
     """Read-only, paginated list of submitted invoices with their ZATCA status, for the sending report.
 
     status_group: 'sent' | 'not_sent' | 'failed' | None (all). invoice_type: 'Standard' | 'Simplified' | None.
+    near_deadline: truthy to list only pending simplified invoices at or past the alert threshold (the rows whose
+    `near_deadline` is true); the counts and total follow it. sort: 'newest' (the default) or 'oldest' first, by
+    posting date and time.
     Only companies with active ZATCA settings that the user may read are listed, under the invoice's own permissions.
     """
     if invoice_doctype not in INVOICE_DOCTYPES:
@@ -355,6 +366,8 @@ def get_sending_status(
         frappe.throw(_('Unknown status group: {0}').format(status_group))
     if invoice_type and invoice_type not in ('Standard', 'Simplified'):
         frappe.throw(_('Unknown invoice type: {0}').format(invoice_type))
+    if sort not in ('newest', 'oldest'):
+        frappe.throw(_('Unknown sort order: {0}').format(sort))
     frappe.has_permission(invoice_doctype, 'read', throw=True)
 
     start = max(cint(start), 0)
@@ -392,6 +405,10 @@ def get_sending_status(
     if invoice_type:
         base.append('siaf.invoice_type_transaction like %(type_prefix)s')
         values['type_prefix'] = '01%' if invoice_type == 'Standard' else '02%'
+    now = now_datetime()
+    if cint(near_deadline):
+        base.append(_near_deadline_condition(col))
+        values.update(cutoff=rules.alert_cutoff(now), pending=rules.PENDING_STATUSES)
 
     from frappe.desk.reportview import get_match_cond
 
@@ -414,6 +431,7 @@ def get_sending_status(
 
     page_where = where + (f' and {group_sql[status_group]}' if status_group else '')
     total = counts[status_group] if status_group else sum(counts.values())
+    direction = 'asc' if sort == 'oldest' else 'desc'
     rows = frappe.db.sql(
         f"""select {inv}.name as invoice, {inv}.company, {col['customer']} as customer,
                 {col['customer_name']} as customer_name, {inv}.posting_date, {col['posting_time']} as posting_time,
@@ -421,20 +439,18 @@ def get_sending_status(
                 siaf.name as siaf, siaf.docstatus as siaf_docstatus, siaf.integration_status,
                 siaf.invoice_type_transaction, siaf.last_attempt
             {joins} where {page_where}
-            order by {inv}.posting_date desc, {col['posting_time']} desc, {inv}.name desc
+            order by {inv}.posting_date {direction}, {col['posting_time']} {direction}, {inv}.name {direction}
             limit %(page_length)s offset %(start)s""",
         values,
         as_dict=True,
     )
 
-    now = now_datetime()
     data = [_status_row(row, invoice_doctype, now) for row in rows]
-    near_deadline = _count_near_deadline(invoice_doctype, companies, customer, match, now)
     return {
         'data': data,
         'total': total,
         'counts': counts,
-        'near_deadline': near_deadline,
+        'near_deadline': _count_near_deadline(invoice_doctype, companies, customer, match, now),
         'start': start,
         'page_length': page_length,
     }
@@ -533,11 +549,18 @@ def _count_near_deadline(invoice_doctype, companies, customer, match, now) -> in
         frappe.db.sql(
             f"""select count(*) from {inv} join `tab{SIAF}` siaf on siaf.sales_invoice = {inv}.name
                 and siaf.invoice_doctype = %(doctype)s and siaf.is_latest = 1
-            where {inv}.docstatus = 1 and {inv}.company in %(companies)s and siaf.docstatus = 0
-                and siaf.integration_status in %(pending)s and siaf.invoice_type_transaction like '02%%'
-                and {col['issued_at']} <= %(cutoff)s{conds}{match}""",
+            where {inv}.docstatus = 1 and {inv}.company in %(companies)s
+                and {_near_deadline_condition(col)}{conds}{match}""",
             values,
         )[0][0]
+    )
+
+
+def _near_deadline_condition(col: dict) -> str:
+    """SQL for a pending simplified invoice at or past the alert threshold; takes %(pending)s and %(cutoff)s."""
+    return (
+        "(siaf.docstatus = 0 and siaf.integration_status in %(pending)s and siaf.invoice_type_transaction like '02%%'"
+        f' and {col["issued_at"]} <= %(cutoff)s)'
     )
 
 
@@ -665,17 +688,24 @@ def dispatch_scheduled_sending() -> None:
 
 def alert_near_reporting_limit() -> None:
     """Notifies the accounts users of each company, once per invoice, about simplified invoices still not reported
-    ALERT_AFTER_HOURS after their issue (ZATCA's limit being REPORTING_LIMIT_HOURS)."""
+    some hours after their issue (ZATCA's limit being REPORTING_LIMIT_HOURS): ALERT_AFTER_HOURS under Live and
+    Batches, SCHEDULED_ALERT_AFTER_HOURS under a scheduled mode, after the safety net has had its runs
+    (rules.alert_after_hours)."""
     now = now_datetime()
     candidates = find_near_deadline(now)
-    recipients: dict[str, list[str]] = {}
+    resolver = ModeResolver(now)
+    recipients: dict[tuple[str, str], list[str]] = {}
     for row in candidates:
         # One row's failure must not stop the rest: rows come oldest first, so it would fail first on every run and
         # no later invoice would ever be alerted on. It stays unmarked and is tried again next run.
         try:
-            if row.company not in recipients:
-                recipients[row.company] = alert_recipients(row.company)
-            users = recipients[row.company]
+            threshold = rules.alert_after_hours(resolver.mode(row))
+            if not rules.is_near_reporting_limit(get_datetime(row.issued_at), now, threshold):
+                continue  # the safety net sends it first; alerted later only if it is still pending
+            key = (row.company, row.invoice_doctype)
+            if key not in recipients:
+                recipients[key] = alert_recipients(row.company, row.invoice_doctype)
+            users = recipients[key]
             if users:
                 _notify(row, users, now)
             frappe.db.set_value(SIAF, row.siaf, 'deadline_alert_sent', 1, update_modified=False)
@@ -701,8 +731,8 @@ def find_near_deadline(now: datetime.datetime) -> list:
             else f'timestamp({inv}.posting_date, {inv}.posting_time)'
         )
         rows += frappe.db.sql(
-            f"""select siaf.name as siaf, siaf.invoice_doctype, {inv}.name as invoice, {inv}.company,
-                    {issued} as issued_at
+            f"""select siaf.name as siaf, siaf.invoice_doctype, siaf.sales_invoice, siaf.precomputed_invoice,
+                    {inv}.name as invoice, {inv}.company, {issued} as issued_at
                 from `tab{SIAF}` siaf join {inv} on {inv}.name = siaf.sales_invoice
                 where siaf.invoice_doctype = {frappe.db.escape(doctype)} and siaf.is_latest = 1
                     and siaf.docstatus = 0 and ifnull(siaf.deadline_alert_sent, 0) = 0
@@ -715,7 +745,8 @@ def find_near_deadline(now: datetime.datetime) -> list:
     return rows
 
 
-def alert_recipients(company: str) -> list[str]:
+def alert_recipients(company: str, invoice_doctype: str) -> list[str]:
+    """Enabled system users with an alert role whose Company user permissions for `invoice_doctype` allow `company`."""
     users = frappe.get_all(
         'Has Role',
         filters={'role': ['in', ALERT_ROLES], 'parenttype': 'User'},
@@ -727,7 +758,7 @@ def alert_recipients(company: str) -> list[str]:
             'User', filters={'name': ['in', users or ['']], 'enabled': 1, 'user_type': 'System User'}, pluck='name'
         )
     )
-    return sorted(u for u in enabled if u != 'Guest' and _user_may_read_company(company, 'Sales Invoice', u))
+    return sorted(u for u in enabled if u != 'Guest' and _user_may_read_company(company, invoice_doctype, u))
 
 
 def _notify(row, users: list[str], now: datetime.datetime) -> None:

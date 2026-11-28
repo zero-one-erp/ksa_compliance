@@ -21,6 +21,13 @@ to a section with the version name.
   invoice type, so standard ones clear at once and show in the type filter and the 24 hour alert; prepayment invoices
   (Payment Entry) follow the same send rule and lock and appear in the status list and «send now»; the send re-reads
   the document for update inside the lock; one failing alert no longer stops the others.
+* Review fixes (r2): an `At a set time` later than the scheduler's last check of the day (after about 23:55) now
+  runs at the first check after it instead of never; under the scheduled modes the 24 hour alert comes at 22 hours,
+  after the 20 hour safety net has had its runs; the alert goes to users who may read that company's invoices of the
+  alerted doctype (POS Invoice, Payment Entry) rather than its Sales Invoices; «send now» answers an unknown invoice
+  and an unreadable one the same way, and its answer is translated; `get_sending_status` takes `near_deadline` and
+  `sort` ('newest' / 'oldest'); the precomputed invoice type backfill covers sent and failed rows too; Arabic for
+  every new message and field.
 
 ## ZerOne 0.61.13 — 2026-10-29
 

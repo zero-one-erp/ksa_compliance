@@ -41,6 +41,10 @@ STATUS_GROUPS = ('sent', 'not_sent', 'failed')
 
 REPORTING_LIMIT_HOURS = 24
 ALERT_AFTER_HOURS = 20
+# Under a scheduled mode the safety net sends at ALERT_AFTER_HOURS; the alert comes two hourly runs later
+SCHEDULED_ALERT_AFTER_HOURS = 22
+# An «At a set time» schedule that never ran starts at the first occurrence the dispatcher sees within this time
+FIRST_RUN_GRACE = datetime.timedelta(hours=1)
 # Pending invoices issued longer ago than this are not alerted on. It keeps a first run on an old site from flooding
 # users, and keeps it inside the retention of the notification log that makes the alert once per invoice.
 ALERT_LOOKBACK_DAYS = 7
@@ -111,13 +115,37 @@ def is_scheduled_run_due(
     if mode == MODE_AT_SET_TIME:
         if sync_time is None:
             return False
-        target = datetime.datetime.combine(now.date(), sync_time)
-        return now >= target and (last_run is None or last_run < target)
+        # The latest occurrence of the set time at or before `now`: yesterday's when today's has not come yet. The
+        # dispatcher checks every few minutes, so a time after its last check of the day (23:56 with checks at
+        # 23:55 and 00:00) is caught by the first check of the next day instead of never.
+        occurrence = latest_occurrence(now, sync_time)
+        if last_run is None:
+            # Never ran: the first run follows an occurrence, not the moment the mode was chosen
+            return now - occurrence < FIRST_RUN_GRACE
+        return last_run < occurrence
 
     if mode == MODE_EVERY_24_HOURS:
         return last_run is None or now - last_run >= datetime.timedelta(hours=24)
 
     return False
+
+
+def latest_occurrence(now: datetime.datetime, at: datetime.time) -> datetime.datetime:
+    """The latest moment at or before `now` whose time of day is `at`."""
+    today = datetime.datetime.combine(now.date(), at)
+    return today if today <= now else today - datetime.timedelta(days=1)
+
+
+def alert_after_hours(mode: Optional[str]) -> float:
+    """Hours after its issue at which a pending simplified invoice raises the reporting-limit alert.
+
+    Under Live and Batches the hourly job sends everything pending, so one still pending at ALERT_AFTER_HOURS is
+    stuck and alerted on then. Under a scheduled mode an invoice issued shortly after a run waits for the safety net
+    (the hourly job sends it at ALERT_AFTER_HOURS, see hourly_job_sends): that is routine, so the alert waits
+    until the net has had its runs and fires only for what is still pending after them."""
+    if normalize_mode(mode) in SCHEDULED_MODES:
+        return SCHEDULED_ALERT_AFTER_HOURS
+    return ALERT_AFTER_HOURS
 
 
 def status_group(integration_status: Optional[str], has_additional_fields: bool = True) -> StatusGroup:

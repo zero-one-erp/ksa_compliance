@@ -431,3 +431,31 @@ Proactive compliance enablement,تمكين استباقي للامتثال,
 Additional support for teams managing higher compliance complexity,دعم إضافي للفرق التي تدير متطلبات امتثال أكثر تعقيدا,
 This document mixes ZATCA tax categories for export of services or goods with non-export categories,هذه الوثيقة تخلط فئات زاتكا ضريبية لتصدير الخدمات أو السلع بفئات ضريبية لغير التصدير,
 "Billing address is mandatory for B2B transactions; Please set the Billing Address on invoice $invoice.","عنوان الفواتير إلزامي لمعاملات B2B؛ يرجى تعيين عنوان الفواتير في الفاتورة $invoice."
+A bulk send for {0} is already running; try again when it ends,إرسال مجمّع لـ {0} قيد التشغيل؛ حاول مرة أخرى عند انتهائه
+A send of this invoice is already in progress,إرسال هذه الفاتورة جارٍ بالفعل
+At most {0} invoices can be sent at once,يمكن إرسال {0} فاتورة كحد أقصى في المرة الواحدة
+Invoice sent to ZATCA. Integration status: {0},أُرسلت الفاتورة إلى زاتكا. حالة التكامل: {0}
+Invoices must be a list of names,يجب أن تكون الفواتير قائمة بأرقامها
+Not permitted for company {0},غير مسموح للشركة {0}
+Not sent; try again,لم تُرسل؛ حاول مرة أخرى
+Sending failed; it will be tried again,تعذّر الإرسال؛ ستُعاد المحاولة
+This invoice is not waiting to be sent,هذه الفاتورة ليست بانتظار الإرسال
+Unknown bulk send,إرسال مجمّع غير معروف
+Unknown invoice type: {0},نوع فاتورة غير معروف: {0}
+Unknown sort order: {0},ترتيب غير معروف: {0}
+Unknown status group: {0},مجموعة حالة غير معروفة: {0}
+Unsupported invoice type: {0},نوع فاتورة غير مدعوم: {0}
+ZATCA: simplified invoice {0} is not reported yet; {1} hours remain of the 24 hour limit,زاتكا: الفاتورة الضريبية المبسطة {0} لم يُبلَّغ عنها بعد؛ تبقّى {1} ساعة من مهلة الـ 24 ساعة
+ZATCA: simplified invoice {0} is past the 24 hour reporting limit and not reported yet,زاتكا: تجاوزت الفاتورة الضريبية المبسطة {0} مهلة الإبلاغ البالغة 24 ساعة ولم يُبلَّغ عنها بعد
+{0} cannot be sent again: its ZATCA status is final ({1}),لا يمكن إرسال {0} مرة أخرى: حالتها في زاتكا نهائية ({1})
+{0} has no ZATCA data to send yet,لا توجد بيانات زاتكا للفاتورة {0} لإرسالها بعد
+{0} is already being sent to ZATCA,{0} قيد الإرسال إلى زاتكا بالفعل
+{0} {1} not found,لم يُعثر على {0} {1}
+At a set time,في وقت محدد
+Every 24 hours,كل 24 ساعة
+How simplified invoices are reported. Standard invoices are always cleared at once. Live: on submission. Batches: every hour. At a set time: daily at the time below. Every 24 hours: a day after the previous run.,طريقة الإبلاغ عن الفواتير الضريبية المبسطة. أما الفواتير الضريبية فتُرسل إلى زاتكا فورًا دائمًا. مباشر: عند الاعتماد. دفعات: كل ساعة. في وقت محدد: يوميًا في الوقت أدناه. كل 24 ساعة: بعد يوم من الإرسال السابق.
+Sending Time,وقت الإرسال
+In the site's time zone,بالمنطقة الزمنية للموقع
+Last Scheduled Sending,آخر إرسال مجدول
+Reporting Deadline Alert Sent,أُرسل تنبيه مهلة الإبلاغ
+Set once the alert before the 24 hour reporting limit was sent,يُضبط عند إرسال التنبيه قبل انتهاء مهلة الإبلاغ البالغة 24 ساعة
