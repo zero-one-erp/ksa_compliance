@@ -8,6 +8,9 @@ to a section with the version name.
 
 ## Unreleased Changes
 
+* ZerOne: the company's cash customer (zerone_business' `Company.zerone_cash_customer`) always gets a simplified
+  (B2C) invoice, whatever the invoice mode (ZR-868).
+
 ## ZerOne 0.61.13 — 2026-10-29
 
 * Correct Phase 1 timestamps in the site timezone and allow address-free simplified prepayments.

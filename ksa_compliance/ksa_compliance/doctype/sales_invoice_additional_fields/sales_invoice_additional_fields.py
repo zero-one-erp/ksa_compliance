@@ -783,7 +783,18 @@ def _get_invoice_type_transaction(invoice_type: InvoiceType, is_export: bool) ->
     return result
 
 
+def is_zerone_cash_customer(settings: ZATCABusinessSettings, customer: Customer | None) -> bool:
+    """ZerOne: the company's cash customer (Company.zerone_cash_customer, set by zerone_business, ZR-868) stands for
+    walk-in buyers. It always gets a simplified (B2C) invoice, whatever the company's invoice mode."""
+    if not customer or not frappe.get_meta('Company').has_field('zerone_cash_customer'):
+        return False
+    return frappe.db.get_value('Company', settings.company, 'zerone_cash_customer') == customer.name
+
+
 def _get_invoice_type(settings: ZATCABusinessSettings, customer: Customer) -> InvoiceType:
+    if is_zerone_cash_customer(settings, customer):
+        return 'Simplified'
+
     if settings.invoice_mode == InvoiceMode.Standard:
         return 'Standard'
 
