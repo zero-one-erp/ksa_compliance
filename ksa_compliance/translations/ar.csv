@@ -2,7 +2,7 @@
 "<pre style=""display:inline;"">JAVA_HOME</pre> path used for running the CLI. Leave blank to use the default system Java installation","<pre style=""display:inline;"">JAVA_HOME</pre> path used for running the CLI. Leave blank to use the default system Java installation"
 About,About
 Accepted,مقبول
-Accepted with warnings,Accepted with warnings
+Accepted with warnings,مقبول مع تحذيرات
 Active,نشط
 Additional Buyer IDs,Additional Buyer IDs
 Additional IDs,Additional IDs
@@ -34,7 +34,7 @@ Charge Indicator,Charge Indicator
 Charge VAT Category Code,Charge VAT Category Code
 Check ZATCA CLI,Check ZATCA CLI
 City,مدينة
-Clearance switched off,Clearance switched off
+Clearance switched off,الاعتماد معطل
 Code for Allowance Reason,Code for Allowance Reason
 Company,شركة
 Company Address,عنوان الشركة
@@ -44,7 +44,7 @@ Company Unit Serial,Company Unit Serial
 Compliance API Error,Compliance API Error
 Compliance Request ID,Compliance Request ID
 Configuration,ترتيب
-Corrected,Corrected
+Corrected,مصحَّح
 Could not find signed XML,Could not find signed XML
 Country,الدولة
 Country Code,Country Code
@@ -56,6 +56,7 @@ Document Level,Document Level
 Documentation,Documentation
 Download XML,Download XML
 Download and Set Up ZATCA CLI,Download and Set Up ZATCA CLI
+Duplicate,تكرار
 E-invoice File,E-invoice File
 EGS Type,EGS Type
 "EGS/device identifier. For ERPNext, enter ""ERPNext"" or similar. For POS devices, enter the POS device ID shown in LavaDo. <br>
@@ -109,7 +110,7 @@ KSA Compliance,KSA Compliance
 Keyboard Shortcuts,اختصارات لوحة المفاتيح
 Last Attempt,Last Attempt
 Let the system decide (both),Let the system decide (both)
-Live,Live
+Live,مباشر
 Log out,Log out
 Manual,يدوي
 Messages,Messages
@@ -154,7 +155,7 @@ Province/State,Province/State
 QR Code,رمز الاستجابة السريعة
 QR Code Image,QR Code Image
 Qr Image Source,Qr Image Source
-Ready For Batch,Ready For Batch
+Ready For Batch,جاهز للإرسال ضمن دفعة
 Reason for Allowance,Reason for Allowance
 Reason for Charge,Reason for Charge
 Reason for Charge Code,Reason for Charge Code
@@ -162,7 +163,7 @@ Registration Type,Registration Type
 Rejected,مرفوض
 Reload,تحديث
 Report an Issue,Report an Issue
-Resend,Resend
+Resend,إعادة الإرسال
 Sales Invoice,فاتورة مبيعات
 Sales Invoice Additional Fields,Sales Invoice Additional Fields
 Secret,سر
