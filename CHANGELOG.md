@@ -8,6 +8,27 @@ to a section with the version name.
 
 ## Unreleased Changes
 
+* Standard (B2B) invoices are cleared with ZATCA on submission whatever `Sync with ZATCA` says.
+* `Sync with ZATCA` gains `At a set time` (daily, at `Sending Time`) and `Every 24 hours` for simplified invoices;
+  `Batches` keeps its hourly behaviour. Under the new modes the hourly job still retries failed sends and sends any
+  simplified invoice 20 hours after its issue.
+* «Send now» for one invoice or up to 100 (`ksa_compliance.zatca_sending.send_now` / `send_now_bulk`), a paginated
+  status list (`get_sending_status`), and an alert 20 hours after issue for simplified invoices not yet reported.
+* Every sender goes through one locked path, so an invoice is never sent twice at once.
+* Security review fixes (ZR-873): «send now» reports `sent` only when ZATCA accepted the invoice (`outcome`: sent /
+  failed / retrying, from the stored status); bulk «send now» runs as one background job per company
+  (`get_bulk_send_status` for progress, one bulk job per company at a time); device-computed invoices store their
+  invoice type, so standard ones clear at once and show in the type filter and the 24 hour alert; prepayment invoices
+  (Payment Entry) follow the same send rule and lock and appear in the status list and «send now»; the send re-reads
+  the document for update inside the lock; one failing alert no longer stops the others.
+* Review fixes (r2): an `At a set time` later than the scheduler's last check of the day (after about 23:55) now
+  runs at the first check after it instead of never; under the scheduled modes the 24 hour alert comes at 22 hours,
+  after the 20 hour safety net has had its runs; the alert goes to users who may read that company's invoices of the
+  alerted doctype (POS Invoice, Payment Entry) rather than its Sales Invoices; «send now» answers an unknown invoice
+  and an unreadable one the same way, and its answer is translated; `get_sending_status` takes `near_deadline` and
+  `sort` ('newest' / 'oldest'); the precomputed invoice type backfill covers sent and failed rows too; Arabic for
+  every new message and field.
+
 ## ZerOne 0.61.13 — 2026-10-29
 
 * Correct Phase 1 timestamps in the site timezone and allow address-free simplified prepayments.

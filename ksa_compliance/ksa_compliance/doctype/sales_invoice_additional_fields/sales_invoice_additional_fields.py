@@ -23,7 +23,7 @@ from frappe.translate import print_language
 from frappe.utils import now_datetime, get_link_to_form, strip, get_url
 from frappe.utils.pdf import get_file_data_from_writer
 from pypdf import PdfWriter
-from result import is_err, Result, Err, Ok, is_ok
+from result import is_err, Result, Err, Ok
 
 from ksa_compliance import SALES_INVOICE_CODE, DEBIT_NOTE_CODE, CREDIT_NOTE_CODE, PREPAYMENT_INVOICE_CODE
 from ksa_compliance import logger
@@ -82,6 +82,7 @@ class SalesInvoiceAdditionalFields(Document):
         charge_indicator: DF.Check
         charge_vat_category_code: DF.Data | None
         code_for_allowance_reason: DF.Data | None
+        deadline_alert_sent: DF.Check
         fatoora_invoice_discount_amount: DF.Float
         integration_status: DF.Literal[
             '',
@@ -173,6 +174,9 @@ class SalesInvoiceAdditionalFields(Document):
                             {'sales_invoice': self.sales_invoice, 'invoice_doctype': self.invoice_doctype}, 'is_latest', 0)
 
         if self.precomputed:
+            # A device computed the XML; the type still decides how it is sent (a standard one is cleared at once),
+            # which the report's type filter and the 24 hour alert read too
+            self.invoice_type_transaction = self._precomputed_invoice_type_transaction()
             return
 
         settings = ZATCABusinessSettings.for_invoice(self.sales_invoice, self.invoice_doctype)
@@ -198,6 +202,27 @@ class SalesInvoiceAdditionalFields(Document):
             self._set_branch_details(sales_invoice)
 
         self._prepare_for_zatca(settings, invoice_type)
+
+    def _precomputed_invoice_type_transaction(self) -> Optional[str]:
+        """The type a device-computed invoice was signed as (InvoiceTypeCode/@name in its XML), else the one the
+        business settings and buyer give, as for an invoice computed here."""
+        from ksa_compliance.zatca_sending_rules import transaction_from_xml
+
+        from_xml = transaction_from_xml(self.invoice_xml)
+        if from_xml:
+            return from_xml
+        try:
+            settings = ZATCABusinessSettings.for_invoice(self.sales_invoice, self.invoice_doctype)
+            if not settings:
+                return None
+            invoice = cast(
+                SalesInvoice | POSInvoice | PaymentEntry, frappe.get_doc(self.invoice_doctype, self.sales_invoice)
+            )
+            invoice_type = _get_invoice_type(settings, self._get_buyer_doc(invoice))
+            return _get_invoice_type_transaction(invoice_type, _check_invoice_for_export(invoice))
+        except Exception:
+            logger.warning(f'Could not tell the invoice type of precomputed {self.sales_invoice}', exc_info=True)
+            return None
 
     def _prepare_for_zatca(self, settings: ZATCABusinessSettings, invoice_type: InvoiceType):
         counting_settings_id, pre_invoice_counter, pre_invoice_hash = frappe.db.get_values(
@@ -666,8 +691,12 @@ def fix_rejection(id: str):
     new_siaf = SalesInvoiceAdditionalFields.create_for_invoice(siaf.sales_invoice, siaf.invoice_doctype)
     new_siaf.insert(ignore_permissions=True)
 
-    if settings.is_live_sync:
-        frappe.utils.background_jobs.enqueue(_submit_additional_fields, doc=new_siaf, enqueue_after_commit=True)
+    from ksa_compliance.zatca_sending_rules import is_standard_transaction, send_on_submit
+
+    if send_on_submit(settings.sync_with_zatca, is_standard_transaction(new_siaf.invoice_type_transaction)):
+        frappe.utils.background_jobs.enqueue(
+            'ksa_compliance.zatca_sending.send_pending_job', siaf_name=new_siaf.name, enqueue_after_commit=True
+        )
 
     frappe.msgprint(ft('Created $link', link=get_link_to_form('Sales Invoice Additional Fields', new_siaf.name)))
 
@@ -699,15 +728,10 @@ def _get_integration_status(code: int) -> ZatcaIntegrationStatus:
 
 
 def _submit_additional_fields(doc: SalesInvoiceAdditionalFields):
-    current_modified = frappe.db.get_value('Sales Invoice Additional Fields', doc.name, 'modified')
-    if current_modified and str(current_modified) != str(doc.modified):
-        logger.info(f'Reloading {doc.name} because it was modified after enqueue')
-        doc.reload()
+    # Kept for jobs enqueued before an upgrade; they go through the locked path by name, like new ones.
+    from ksa_compliance.zatca_sending import send_pending
 
-    logger.info(f'Submitting {doc.name}')
-    result = doc.submit_to_zatca()
-    message = result.ok_value if is_ok(result) else result.err_value
-    logger.info(f'Submission result: {message}')
+    send_pending(doc.name)
 
 
 @frappe.whitelist()

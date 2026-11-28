@@ -164,7 +164,15 @@ doc_events = {
 # Scheduled Tasks
 # ---------------
 
-scheduler_events = {'hourly_long': ['ksa_compliance.background_jobs.sync_e_invoices']}
+scheduler_events = {
+    'hourly_long': ['ksa_compliance.background_jobs.sync_e_invoices'],
+    'cron': {
+        # Cheap check that starts a company's run when its set time or 24 hours have come
+        '*/5 * * * *': ['ksa_compliance.zatca_sending.dispatch_scheduled_sending'],
+        # Alert before ZATCA's 24 hour reporting limit for simplified invoices
+        '*/30 * * * *': ['ksa_compliance.zatca_sending.alert_near_reporting_limit'],
+    },
+}
 # "all": [
 # "ksa_compliance.tasks.all"
 # ],

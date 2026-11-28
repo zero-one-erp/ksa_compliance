@@ -7,7 +7,6 @@ from erpnext.accounts.doctype.pos_invoice.pos_invoice import POSInvoice
 from erpnext.accounts.doctype.sales_invoice.sales_invoice import SalesInvoice
 from erpnext.selling.doctype.customer.customer import Customer
 from frappe import _
-from result import is_ok
 
 from ksa_compliance import logger
 from ksa_compliance.ksa_compliance.doctype.sales_invoice_additional_fields.sales_invoice_additional_fields import (
@@ -24,6 +23,8 @@ from ksa_compliance.ksa_compliance.doctype.zatca_precomputed_invoice.zatca_preco
 )
 
 from ksa_compliance.translation import ft
+from ksa_compliance.zatca_sending import send_pending
+from ksa_compliance.zatca_sending_rules import is_standard_transaction, send_on_submit
 
 IGNORED_INVOICES = set()
 
@@ -66,7 +67,7 @@ def create_sales_invoice_additional_fields_doctype(self: SalesInvoice | POSInvoi
 
     si_additional_fields_doc = SalesInvoiceAdditionalFields.create_for_invoice(self.name, self.doctype)
     precomputed_invoice = ZATCAPrecomputedInvoice.for_invoice(self.name)
-    is_live_sync = settings.is_live_sync
+    sending_mode = settings.sync_with_zatca
     if precomputed_invoice:
         logger.info(f'Using precomputed invoice {precomputed_invoice.name} for {self.name}')
         si_additional_fields_doc.use_precomputed_invoice(precomputed_invoice)
@@ -76,27 +77,24 @@ def create_sales_invoice_additional_fields_doctype(self: SalesInvoice | POSInvoi
             logger.warning(f'Could not find EGS for device {precomputed_invoice.device_id}')
         else:
             # EGS Setting overrides company-wide setting
-            is_live_sync = egs_settings.is_live_sync
+            sending_mode = egs_settings.sync_with_zatca
 
     si_additional_fields_doc.insert()
-    if is_live_sync:
+    # A standard (B2B) invoice is cleared at once whatever the mode; a simplified one follows the mode
+    is_standard = is_standard_transaction(si_additional_fields_doc.invoice_type_transaction)
+    if send_on_submit(sending_mode, is_standard):
         # We're running in the context of invoice submission (on_submit hook). We only want to run our ZATCA logic if
         # the invoice submits successfully after on_submit is run successfully from all apps.
         frappe.utils.background_jobs.enqueue(
-            _submit_additional_fields, doc=si_additional_fields_doc, enqueue_after_commit=True
+            'ksa_compliance.zatca_sending.send_pending_job',
+            siaf_name=si_additional_fields_doc.name,
+            enqueue_after_commit=True,
         )
 
 
 def _submit_additional_fields(doc: SalesInvoiceAdditionalFields):
-    current_modified = frappe.db.get_value('Sales Invoice Additional Fields', doc.name, 'modified')
-    if current_modified and str(current_modified) != str(doc.modified):
-        logger.info(f'Reloading {doc.name} because it was modified after enqueue')
-        doc.reload()
-
-    logger.info(f'Submitting {doc.name}')
-    result = doc.submit_to_zatca()
-    message = result.ok_value if is_ok(result) else result.err_value
-    logger.info(f'Submission result: {message}')
+    # Kept for jobs enqueued before an upgrade; new ones go through the locked path by name.
+    send_pending(doc.name)
 
 
 def _should_enable_zatca_for_invoice(invoice_id: str) -> bool:
